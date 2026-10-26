@@ -2,3 +2,4 @@ out/
 build/
 *.exe
 *.c
+jog.lock

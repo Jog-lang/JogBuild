@@ -1,9 +1,13 @@
 # Notes
 
-- [Plan.md](Plan.md): the implementation plan, eleven milestones, and the open points found in the spec. Start here.
-- [Checks.md](Checks.md): one checklist per milestone, with the commands.
-- [Packages.md](Packages.md): the spec, a copy of CTools `docs/design/Packages.md`. That file is the master; when it changes, copy it here again.
-- [study/Packaging.md](study/Packaging.md): background on manifests, version selection, lock files, zip, and caches, with the `ziplist` exercise. A copy of CTools `docs/bootstrap/study/Packaging.md`.
-- [Reading.md](Reading.md): the specifications and articles the plan cites.
+The notes this folder used to hold now live in JogDocs, at `D:/Projects/Jog/JogDocs` ([github.com/Jog-lang/JogDocs](https://github.com/Jog-lang/JogDocs)). Edit them there, not here.
 
-The copied notes link with Obsidian links such as `[[design/Modules]]`. Those targets, and the rest of the language spec, live in D:/Projects/CTools/docs.
+- `projects/JogBuild/Plan.md`: the implementation plan, eleven milestones, and the open points found in the spec. Start here.
+- `projects/JogBuild/Checks.md`: one checklist per milestone, with the commands.
+- `design/Packages.md`: the spec (`jog.mod` v2, `.jogz`, `jog.lock`, the cache, the compiler contract).
+- `bootstrap/study/Packaging.md`: background on manifests, version selection, lock files, zip, and caches, with the `ziplist` exercise.
+- `projects/JogBuild/Reading.md`: the specifications and articles the plan cites.
+
+Plan.md and Checks.md are Ivan's working checklists. He edits them in JogDocs `projects/JogBuild/`; there is no copy here.
+
+Code comments in `src/`, `main.jog` and `jog.mod` that cite `notes/Packages.md`, `notes/Plan.md`, `notes/Reading.md` or `notes/study/Packaging.md` mean the JogDocs files above.

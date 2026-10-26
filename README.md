@@ -1,21 +1,23 @@
 # Jog-build
-a build tool for Jog. It is used alongside the Jog Compiler.
 
-## Start here
+A build tool for Jog. It reads a module's `jog.mod`, resolves its dependencies (local folders and `.jogz` archives), unpacks archives into a per-user cache, writes `jog.lock`, packs libraries, and runs the compiler with one `--module <name>=<dir>` flag per dependency. It is written in Jog. The format it follows is `design/Packages.md` in JogDocs.
 
-`jog-build` reads a module's `jog.mod`, resolves its dependencies (local folders and `.jogz` archives), unpacks archives into a per-user cache, writes `jog.lock`, packs libraries, and runs the compiler with one `--module <name>=<dir>` flag per dependency. It is written in Jog. The format it follows is `notes/Packages.md`.
+The notes for this repo live in JogDocs, at `D:/Projects/Jog/JogDocs` ([github.com/Jog-lang/JogDocs](https://github.com/Jog-lang/JogDocs)), not here. `notes/README.md` only points there.
 
-The compiler is `D:\Projects\CTools\build\jog.exe`. From the repo root:
+The compiler command is `jog`. On this machine the binary is `D:\Projects\Jog\JogCompiler\build\jog.exe`. When `JOG` is set, that path is the compiler. From the repo root:
 
 ```
-D:\Projects\CTools\build\jog.exe build -o out/jog-build.exe
+jog build -o out/jog-build.exe
 out\jog-build.exe help
-D:\Projects\CTools\build\jog.exe test
+jog test
 ```
 
-Today only `help` works; every other command says it is not implemented yet. `jog test` fails until the first `@test` is written: with no tests it runs `main`, which exits 2 without arguments.
+The commands are `init`, `build`, `run`, `test`, `pack`, `deps`, and `help`. The eleven milestones in JogDocs `projects/JogBuild/Checks.md` are done. The two Throughout boxes there are still open.
 
 - `AGENTS.md`: how this repo is worked on.
-- `notes/Plan.md`: what to implement, in order, and how to test each step.
-- `notes/Checks.md`: the checklists.
+- JogDocs `projects/JogBuild/Plan.md`: the milestones and how each one was tested.
+- JogDocs `projects/JogBuild/Checks.md`: the checklists.
+- JogDocs `design/Packages.md` (the spec) and `bootstrap/study/Packaging.md` (the background).
 - `testdata/`: the inputs the plan refers to.
+
+Plan.md and Checks.md are Ivan's working checklists. He edits them in JogDocs, in `D:/Projects/Jog/JogDocs/projects/JogBuild/`.
