@@ -1,0 +1,186 @@
+import std.arena
+import std.fs
+import std.list
+import std.mem
+import std.os
+import std.testing
+
+import src.manifest
+import src.text
+
+fn parent_of(path: str): str with (a: mem.Allocator) {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            return text.copy_str(text.view_range(path, 0, i))
+        }
+    }
+    return ""
+}
+
+fn repo_root(): str with (a: mem.Allocator) {
+    val exe = os.argv(0)
+    val out_dir = parent_of(exe)
+    val root = parent_of(out_dir)
+    text.free_str(out_dir)
+    return root
+}
+
+fn jog_ver(): manifest.Version {
+    var (v, ok) = manifest.parse_version("0.0.1")
+    if !ok {
+        panic("0.0.1")
+    }
+    return v
+}
+
+fn app_dir(folder: str): str with (a: mem.Allocator) {
+    val root = repo_root()
+    val graph = fs.join(root, "testdata/graph")
+    val base = fs.join(graph, folder)
+    val app = fs.join(base, "app")
+    text.free_str(root)
+    text.free_str(graph)
+    text.free_str(base)
+    return app
+}
+
+@test
+fn path_normalization() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expectEq(absolute("D:/ignored", "D:/x/../y/./z"), "D:/y/z")
+        t.expectEq(absolute("D:\\a\\app", "..\\lib"), "D:/a/lib")
+        t.expect(same_folder("D:/a/lib", "d:/a/lib"))
+        val root = repo_root()
+        val a = fs.join(root, "testdata/graph/diamond/a")
+        val b = fs.join(root, "testdata/graph/diamond/b")
+        val from_a = absolute(a, "../c")
+        val from_b = absolute(b, "../b/../c")
+        t.expectEq(from_a, from_b)
+    }
+    ar.release()
+}
+
+@test
+fn missing_version_message() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val msg = missing_cache_message("json", "1.4.0")
+        t.expectEq(msg, "module 'json' 1.4.0 is not in the cache; fetching is not available yet; require it by the path of its .jogz")
+    }
+    ar.release()
+}
+
+fn resolves(folder: str): bool with (a: mem.Allocator) {
+    val app = app_dir(folder)
+    var (g, ok) = resolve(app, jog_ver())
+    return ok
+}
+
+@test
+fn diamond_orders_c_first() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val app = app_dir("diamond")
+        var (g, ok) = resolve(app, jog_ver())
+        t.expect(ok)
+        t.expect(g.nodes.len == 3)
+        if g.nodes.len == 3 {
+            t.expect(g.nodes.get(0).name == "c")
+            t.expect(g.nodes.get(1).name == "a")
+            t.expect(g.nodes.get(2).name == "b")
+            t.expect(g.nodes.get(0).version.minor == "4")
+            val a = absolute(app, "../a")
+            val b = absolute(app, "../b")
+            t.expectEq(g.nodes.get(0).dir, absolute(a, "../c"))
+            t.expectEq(g.nodes.get(0).dir, absolute(b, "../b/../c"))
+            t.expectEq(g.nodes.get(1).dir, a)
+            t.expectEq(g.nodes.get(2).dir, b)
+        }
+    }
+    ar.release()
+}
+
+@test
+fn conflict_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("conflict"))
+    }
+    ar.release()
+}
+
+@test
+fn cycle_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("cycle"))
+    }
+    ar.release()
+}
+
+@test
+fn wrongname_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("wrongname"))
+    }
+    ar.release()
+}
+
+@test
+fn notlib_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("notlib"))
+    }
+    ar.release()
+}
+
+@test
+fn newjog_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("newjog"))
+    }
+    ar.release()
+}
+
+@test
+fn caseclash_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("caseclash"))
+    }
+    ar.release()
+}
+
+@test
+fn missing_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("missing"))
+    }
+    ar.release()
+}
+
+@test
+fn badchild_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("badchild"))
+    }
+    ar.release()
+}
+
+@test
+fn notcached_fails() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        t.expect(!resolves("notcached"))
+    }
+    ar.release()
+}

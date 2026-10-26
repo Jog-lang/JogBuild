@@ -1,0 +1,187 @@
+// Package src.compiler: finding jog, building its command line, and
+// running it. One --module <name>=<dir> per dependency, in resolution
+// order. The root folder is the package argument: proc.run has no
+// working directory.
+//
+// proc.run waits and captures both streams. run_jog prints stdout, then
+// stderr, and returns the child's code. See Friction.md, "proc.run waits".
+
+import std.c
+import std.fs
+import std.io
+import std.list
+import std.mem
+import std.os
+import std.proc
+import std.strbuilder
+
+import src.manifest
+import src.resolve
+import src.text
+
+// std.c does not bind this. 0xFFFFFFFF means the path is missing.
+private extern {
+    fn GetFileAttributesA(name: *const c.char): c.unsigned_long
+}
+
+private fn file_exists(path: str): bool {
+    if path.len == 0 || path.len >= 4096 {
+        return false
+    }
+    var buf: [4096]u8
+    c.memcpy(buf[..].ptr as *void, path.ptr as *const void, path.len)
+    *(buf[..].ptr + path.len) = 0
+    val attr = GetFileAttributesA(buf[..].ptr as *const c.char)
+    if attr == 0xFFFFFFFF as c.unsigned_long {
+        return false
+    }
+    val directory: c.unsigned_long = 0x10
+    return (attr & directory) == 0
+}
+
+fn find(): (str, bool) with (a: mem.Allocator) {
+    var (jog_env, jok) = os.env("JOG")
+    if jok && jog_env.len > 0 {
+        return text.copy_str(jog_env), true
+    }
+    var (path_env, pok) = os.env("PATH")
+    if !pok || path_env.len == 0 {
+        return "", false
+    }
+    val path = text.copy_str(path_env)
+    var parts = text.split(path, ';' as u8)
+    var found: str = ""
+    var i: usize = 0
+    for i < parts.len {
+        val dir = parts.get(i)
+        if dir.len > 0 && found.len == 0 {
+            val candidate = fs.join(dir, "jog.exe")
+            if file_exists(candidate) {
+                found = candidate
+            } else {
+                text.free_str(candidate)
+            }
+        }
+        i = i + 1
+    }
+    parts.free()
+    text.free_str(path)
+    if found.len == 0 {
+        return "", false
+    }
+    return found, true
+}
+
+fn module_arg(name: str, dir: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(name)
+    b.append("=")
+    b.append(dir)
+    val text = text.copy_str(b.str())
+    b.free()
+    return text
+}
+
+fn module_flags(g: resolve.Graph): list.List<str> with (a: mem.Allocator) {
+    var flags: list.List<str>
+    var i: usize = 0
+    for i < g.nodes.len {
+        val n = g.nodes.get(i)
+        flags.push("--module")
+        flags.push(module_arg(n.name, n.dir))
+        i = i + 1
+    }
+    return flags
+}
+
+// flags is the --module pairs. extra is the remaining jog flags.
+fn command(jog: str, sub: str, root: str, flags: []str, extra: []str): list.List<str> with (a: mem.Allocator) {
+    var argv: list.List<str>
+    argv.push(jog)
+    argv.push(sub)
+    argv.push(root)
+    var i: usize = 0
+    for i < flags.len {
+        argv.push(flags[i])
+        i = i + 1
+    }
+    i = 0
+    for i < extra.len {
+        argv.push(extra[i])
+        i = i + 1
+    }
+    return argv
+}
+
+fn run_jog(args: []str): i32 with (a: mem.Allocator) {
+    val out = proc.run(args)
+    if !out.ok {
+        proc.free_output(out)
+        io.eprintln("jog-build: cannot run the compiler")
+        return 1
+    }
+    val out_text: str = out.stdout
+    val err_text: str = out.stderr
+    io.print(out_text)
+    io.eprint(err_text)
+    val code = out.code
+    proc.free_output(out)
+    return code
+}
+
+private fn version_word(src: str): str {
+    var i: usize = 0
+    for i < src.len {
+        val c = src.ptr[i]
+        if c != ' ' as u8 && c != '\t' as u8 && c != '\n' as u8 && c != '\r' as u8 {
+            break
+        }
+        i = i + 1
+    }
+    for i < src.len {
+        val c = src.ptr[i]
+        if c == ' ' as u8 || c == '\t' as u8 || c == '\n' as u8 || c == '\r' as u8 {
+            break
+        }
+        i = i + 1
+    }
+    for i < src.len {
+        val c = src.ptr[i]
+        if c != ' ' as u8 && c != '\t' as u8 && c != '\n' as u8 && c != '\r' as u8 {
+            break
+        }
+        i = i + 1
+    }
+    val start = i
+    for i < src.len {
+        val c = src.ptr[i]
+        if c == ' ' as u8 || c == '\t' as u8 || c == '\n' as u8 || c == '\r' as u8 {
+            break
+        }
+        i = i + 1
+    }
+    return text.view_range(src, start, i)
+}
+
+fn version(jog: str): (manifest.Version, bool) with (a: mem.Allocator) {
+    var args: list.List<str>
+    args.push(jog)
+    args.push("version")
+    val out = proc.run(args.slice_view())
+    args.free()
+    var blank: manifest.Version
+    if !out.ok {
+        proc.free_output(out)
+        return blank, false
+    }
+    val text: str = out.stdout
+    val word = version_word(text)
+    var (v, ok) = manifest.parse_version(word)
+    if !ok {
+        proc.free_output(out)
+        return blank, false
+    }
+    val owned = manifest.copy_version(v)
+    proc.free_output(out)
+    return owned, true
+}

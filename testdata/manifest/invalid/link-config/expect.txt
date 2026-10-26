@@ -1,0 +1,1 @@
+jog.mod:2:6: error: jog.mod: unknown target 'debug'; expected windows, linux, or macos

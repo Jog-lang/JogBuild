@@ -1,0 +1,8 @@
+import std.io
+import a
+import b
+
+fn main() {
+    io.println(a.name())
+    io.println(b.name())
+}

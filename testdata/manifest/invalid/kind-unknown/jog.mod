@@ -1,0 +1,2 @@
+module demo
+kind plugin

@@ -1,0 +1,116 @@
+import std.arena
+import std.fs
+import std.list
+import std.mem
+import std.os
+import std.strbuilder
+import std.testing
+
+import src.text
+
+fn parent_of(path: str): str with (a: mem.Allocator) {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            return text.copy_str(text.view_range(path, 0, i))
+        }
+    }
+    return ""
+}
+
+fn repo_root(): str with (a: mem.Allocator) {
+    val exe = os.argv(0)
+    val out_dir = parent_of(exe)
+    val root = parent_of(out_dir)
+    text.free_str(out_dir)
+    return root
+}
+
+fn join_args(args: list.List<str>): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    var i: usize = 0
+    for i < args.len {
+        if i > 0 {
+            b.append("\n")
+        }
+        b.append(args.get(i))
+        i = i + 1
+    }
+    val text = text.copy_str(b.str())
+    b.free()
+    return text
+}
+
+@test
+fn build_arguments() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var flags: list.List<str>
+        flags.push("--module")
+        flags.push("a=A")
+        flags.push("--module")
+        flags.push("b=B")
+        var extra: list.List<str>
+        extra.push("--release")
+        var argv = command("jog", "build", "D:/app", flags.slice_view(), extra.slice_view())
+        val got = join_args(argv)
+        t.expectEq(got, "jog\nbuild\nD:/app\n--module\na=A\n--module\nb=B\n--release")
+    }
+    ar.release()
+}
+
+@test
+fn run_arguments() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var flags: list.List<str>
+        flags.push("--module")
+        flags.push("a=A")
+        flags.push("--module")
+        flags.push("b=B")
+        var extra: list.List<str>
+        extra.push("--target")
+        extra.push("wasm32")
+        extra.push("--")
+        extra.push("--release")
+        var argv = command("jog", "run", "D:/app", flags.slice_view(), extra.slice_view())
+        val got = join_args(argv)
+        t.expectEq(got, "jog\nrun\nD:/app\n--module\na=A\n--module\nb=B\n--target\nwasm32\n--\n--release")
+    }
+    ar.release()
+}
+
+@test
+fn test_arguments() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var flags: list.List<str>
+        flags.push("--module")
+        flags.push("a=A")
+        flags.push("--module")
+        flags.push("b=B")
+        var extra: list.List<str>
+        extra.push("--all")
+        var argv = command("jog", "test", "D:/app", flags.slice_view(), extra.slice_view())
+        val got = join_args(argv)
+        t.expectEq(got, "jog\ntest\nD:/app\n--module\na=A\n--module\nb=B\n--all")
+    }
+    ar.release()
+}
+
+@test
+fn library_build_is_check() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var flags: list.List<str>
+        flags.push("--module")
+        flags.push("a=A")
+        var extra: list.List<str>
+        var argv = command("jog", "check", "D:/lib", flags.slice_view(), extra.slice_view())
+        val got = join_args(argv)
+        t.expectEq(got, "jog\ncheck\nD:/lib\n--module\na=A")
+    }
+    ar.release()
+}

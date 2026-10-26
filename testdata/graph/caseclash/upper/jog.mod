@@ -1,0 +1,2 @@
+module Json
+kind library

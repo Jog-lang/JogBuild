@@ -1,0 +1,512 @@
+// Package src.zip: a store-only zip reader and writer, and CRC-32. The
+// container rules are notes/Packages.md, "Container: zip"; the byte
+// layout is notes/study/Packaging.md, "The zip layout", and the PKWARE
+// APPNOTE sections 4.3 and 4.4. Every number is little-endian.
+// Milestone 6 of notes/Plan.md.
+//
+// Writer, fixed by the spec so that packing twice gives the same bytes:
+// method 0, flags 0x0800 (bit 11, UTF-8 names; bit 3 clear), version
+// needed 10, DOS time 0 and date 0x0021, external attributes 0, no extra
+// fields, no comments, no directory entries. The caller passes entries
+// already in archive order (manifest first, then names in byte order).
+//
+// Reader: find the end of central directory record from the end, walk
+// the central directory, and reject before returning any entry. Rejected:
+// a method other than 0, flag bit 3 (data descriptor), a non-empty extra
+// field, a bad CRC, a name that is empty, absolute, has a drive letter
+// or a backslash, has an empty, "." or ".." segment, or appears twice,
+// and a length or offset that falls outside the file. Flag bit 11 and
+// version-needed 10 are not required, so Compress-Archive with method 0,
+// flags 0 and no extras still reads. Entry names and bytes are views
+// into data. On failure the message is a new block and the list is empty;
+// free_text releases that message. On success the message is "".
+//
+// CRC-32: reflected polynomial 0xEDB88320, register starts at 0xFFFFFFFF,
+// result complemented. crc32("123456789") is 0xCBF43926. CTools
+// tests/jog/crc.jog builds the table with @comptime. This table is built
+// at startup. crc32_update continues a finished CRC: crc32_update(crc32(x), y)
+// is crc32 of x followed by y, and crc32_update(0, data) is crc32(data).
+
+import std.c
+import std.list
+import std.mem
+import std.strbuilder
+
+struct Entry {
+    name: str
+    data: bytes
+    crc: u32
+}
+
+// Copies text. An empty str allocates nothing.
+private fn copy_text(text: str): str with (a: mem.Allocator) {
+    if text.len == 0 {
+        return ""
+    }
+    val (raw, err) = a.alloc(text.len, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    c.memcpy(raw.ptr as *void, text.ptr as *const void, text.len)
+    return raw
+}
+
+// Releases a block from copy_text. An empty str allocates nothing.
+fn free_text(text: str) with (a: mem.Allocator) {
+    if text.len == 0 {
+        return
+    }
+    var block = bytes()
+    block.ptr = text.ptr as *u8
+    block.len = text.len
+    a.free(block)
+}
+
+fn make_crc_table(): [256]u32 {
+    var t: [256]u32
+    for i in 0 as usize..256 {
+        var c = i as u32
+        for _ in 0 as usize..8 {
+            if c & 1 != 0 {
+                c = 0xEDB88320 ^ (c >> 1)
+            } else {
+                c = c >> 1
+            }
+        }
+        t[i] = c
+    }
+    return t
+}
+
+val crc_table = make_crc_table()
+
+// Continues a CRC over more bytes. crc is a finished value, including 0
+// for an empty prefix; the register is un-complemented, updated, and
+// complemented again.
+fn crc32_update(crc: u32, data: bytes): u32 {
+    var reg = crc ^ 0xFFFFFFFF
+    var i: usize = 0
+    for i < data.len {
+        val b = data.ptr[i] as u32
+        val idx = ((reg ^ b) & 0xFF) as usize
+        reg = crc_table[idx] ^ (reg >> 8)
+        i = i + 1
+    }
+    return reg ^ 0xFFFFFFFF
+}
+
+// CRC-32 of data, as zip stores it.
+fn crc32(data: bytes): u32 {
+    return crc32_update(0, data)
+}
+
+private fn segment_ok(name: str, start: usize, end: usize): bool {
+    if end < start {
+        return false
+    }
+    val n = end - start
+    if n == 0 {
+        return false
+    }
+    if n == 1 && name.ptr[start] == '.' as u8 {
+        return false
+    }
+    if n == 2 && name.ptr[start] == '.' as u8 && name.ptr[start + 1] == '.' as u8 {
+        return false
+    }
+    return true
+}
+
+// True when name is a relative zip path: no leading slash, no backslash,
+// no colon, and no empty, "." or ".." segment.
+fn check_name(name: str): bool {
+    if name.len == 0 {
+        return false
+    }
+    if name.ptr[0] == '/' as u8 {
+        return false
+    }
+    var start: usize = 0
+    var i: usize = 0
+    for i < name.len {
+        val b = name.ptr[i]
+        if b == '\\' as u8 || b == ':' as u8 {
+            return false
+        }
+        if b == '/' as u8 {
+            if !segment_ok(name, start, i) {
+                return false
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return segment_ok(name, start, name.len)
+}
+
+private fn same_text(left: str, right: str): bool {
+    if left.len != right.len {
+        return false
+    }
+    var i: usize = 0
+    for i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn put_u16(p: *u8, at: usize, v: u32) {
+    p[at] = (v & 0xFF) as u8
+    p[at + 1] = ((v >> 8) & 0xFF) as u8
+}
+
+private fn put_u32(p: *u8, at: usize, v: u32) {
+    put_u16(p, at, v & 0xFFFF)
+    put_u16(p, at + 2, v >> 16)
+}
+
+private fn u16_at(data: bytes, at: usize): u32 {
+    val b0 = data.ptr[at] as u32
+    val b1 = data.ptr[at + 1] as u32
+    return b0 | (b1 << 8)
+}
+
+private fn u32_at(data: bytes, at: usize): u32 {
+    val lo = u16_at(data, at)
+    val hi = u16_at(data, at + 2)
+    return lo | (hi << 16)
+}
+
+private fn view_bytes(data: bytes, at: usize, n: usize): bytes {
+    var out = bytes()
+    if n == 0 {
+        return out
+    }
+    out.ptr = data.ptr + at
+    out.len = n
+    return out
+}
+
+private fn view_str(data: bytes, at: usize, n: usize): str {
+    return view_bytes(data, at, n)
+}
+
+private fn copy_at(p: *u8, at: usize, text: str) {
+    if text.len == 0 {
+        return
+    }
+    c.memcpy((p + at) as *void, text.ptr as *const void, text.len)
+}
+
+private fn entry_msg(name: str, tail: str): str with (a: mem.Allocator) {
+    var sb = strbuilder.empty()
+    sb.append("entry '")
+    sb.append(name)
+    sb.append("'")
+    sb.append(tail)
+    val text = copy_text(sb.str())
+    sb.free()
+    return text
+}
+
+private fn method_msg(name: str, method: u32): str with (a: mem.Allocator) {
+    var sb = strbuilder.empty()
+    sb.append("entry '")
+    sb.append(name)
+    sb.append("' uses compression method ")
+    sb.append_int(method as i64, 10)
+    sb.append("; only stored entries are supported")
+    val text = copy_text(sb.str())
+    sb.free()
+    return text
+}
+
+private fn listed(entries: list.List<Entry>, name: str): bool {
+    var i: usize = 0
+    for i < entries.len {
+        if same_text(entries.get(i).name, name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Writes one local header and its stored bytes. Returns the next offset.
+private fn write_local(p: *u8, at: usize, e: Entry): usize {
+    val crc = crc32(e.data)
+    val n = e.data.len as u32
+    put_u32(p, at, 0x04034b50)
+    put_u16(p, at + 4, 10)
+    put_u16(p, at + 6, 0x0800)
+    put_u16(p, at + 8, 0)
+    put_u16(p, at + 10, 0)
+    put_u16(p, at + 12, 0x0021)
+    put_u32(p, at + 14, crc)
+    put_u32(p, at + 18, n)
+    put_u32(p, at + 22, n)
+    put_u16(p, at + 26, e.name.len as u32)
+    put_u16(p, at + 28, 0)
+    var pos = at + 30
+    copy_at(p, pos, e.name)
+    pos = pos + e.name.len
+    if e.data.len > 0 {
+        c.memcpy((p + pos) as *void, e.data.ptr as *const void, e.data.len)
+        pos = pos + e.data.len
+    }
+    return pos
+}
+
+private fn write_central(p: *u8, at: usize, e: Entry, local_off: u32): usize {
+    val crc = crc32(e.data)
+    val n = e.data.len as u32
+    put_u32(p, at, 0x02014b50)
+    put_u16(p, at + 4, 10)
+    put_u16(p, at + 6, 10)
+    put_u16(p, at + 8, 0x0800)
+    put_u16(p, at + 10, 0)
+    put_u16(p, at + 12, 0)
+    put_u16(p, at + 14, 0x0021)
+    put_u32(p, at + 16, crc)
+    put_u32(p, at + 20, n)
+    put_u32(p, at + 24, n)
+    put_u16(p, at + 28, e.name.len as u32)
+    put_u16(p, at + 30, 0)
+    put_u16(p, at + 32, 0)
+    put_u16(p, at + 34, 0)
+    put_u16(p, at + 36, 0)
+    put_u32(p, at + 38, 0)
+    put_u32(p, at + 42, local_off)
+    copy_at(p, at + 46, e.name)
+    return at + 46 + e.name.len
+}
+
+private fn write_eocd(p: *u8, at: usize, count: usize, cd_size: usize, cd_off: usize) {
+    put_u32(p, at, 0x06054b50)
+    put_u16(p, at + 4, 0)
+    put_u16(p, at + 6, 0)
+    put_u16(p, at + 8, count as u32)
+    put_u16(p, at + 10, count as u32)
+    put_u32(p, at + 12, cd_size as u32)
+    put_u32(p, at + 16, cd_off as u32)
+    put_u16(p, at + 20, 0)
+}
+
+// entries are already in archive order. The result is one block of
+// exactly the archive bytes.
+fn write(entries: []Entry): bytes with (a: mem.Allocator) {
+    if entries.len > 65535 {
+        panic("zip has too many entries")
+    }
+    var total: usize = 22
+    var i: usize = 0
+    for i < entries.len {
+        val e = entries[i]
+        if e.name.len > 65535 {
+            panic("zip entry name is too long")
+        }
+        if e.data.len > 0xFFFFFFFF {
+            panic("zip entry is too long")
+        }
+        total = total + 30
+        total = total + e.name.len
+        total = total + e.data.len
+        total = total + 46
+        total = total + e.name.len
+        i = i + 1
+    }
+    val (raw, err) = a.alloc(total, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    val p = raw.ptr
+    var offsets: list.List<u32>
+    var at: usize = 0
+    i = 0
+    for i < entries.len {
+        offsets.push(at as u32)
+        at = write_local(p, at, entries[i])
+        i = i + 1
+    }
+    val cd_off = at
+    i = 0
+    for i < entries.len {
+        at = write_central(p, at, entries[i], offsets.get(i))
+        i = i + 1
+    }
+    val cd_size = at - cd_off
+    if at + 22 != total {
+        panic("zip writer size mismatch")
+    }
+    write_eocd(p, at, entries.len, cd_size, cd_off)
+    offsets.free()
+    return raw
+}
+
+// The end record is 22 bytes plus a comment of at most 65535 bytes, so
+// it starts in the last 65557 bytes. A signature matches only when its
+// comment length lands on the end of the file.
+private fn find_eocd(data: bytes): (usize, bool) {
+    if data.len < 22 {
+        return 0, false
+    }
+    var at = data.len - 22
+    var left: usize = 65536
+    for left > 0 {
+        if u32_at(data, at) == 0x06054b50 {
+            val comment = u16_at(data, at + 20) as usize
+            val tail = data.len - (at + 22)
+            if comment == tail {
+                return at, true
+            }
+        }
+        if at == 0 {
+            break
+        }
+        at = at - 1
+        left = left - 1
+    }
+    return 0, false
+}
+
+// Checks the local header and returns the offset of the stored bytes.
+// name, crc, comp and uncomp are the central directory's values.
+private fn check_local(data: bytes, local_off: usize, name: str, crc: u32, comp: u32, uncomp: u32): (usize, str, bool) with (a: mem.Allocator) {
+    if local_off > data.len || data.len - local_off < 30 {
+        return 0, copy_text("archive is truncated"), false
+    }
+    if u32_at(data, local_off) != 0x04034b50 {
+        return 0, copy_text("bad local header"), false
+    }
+    val flags = u16_at(data, local_off + 6)
+    val method = u16_at(data, local_off + 8)
+    val local_crc = u32_at(data, local_off + 14)
+    val local_comp = u32_at(data, local_off + 18)
+    val local_uncomp = u32_at(data, local_off + 22)
+    val name_len = u16_at(data, local_off + 26) as usize
+    val extra_len = u16_at(data, local_off + 28) as usize
+    val name_at = local_off + 30
+    if name_len > data.len - name_at {
+        return 0, copy_text("archive is truncated"), false
+    }
+    if method != 0 {
+        return 0, method_msg(name, method), false
+    }
+    if flags & 0x0008 != 0 {
+        return 0, entry_msg(name, " uses a data descriptor"), false
+    }
+    if extra_len != 0 {
+        return 0, entry_msg(name, " has an extra field"), false
+    }
+    if !same_text(view_str(data, name_at, name_len), name) {
+        return 0, entry_msg(name, " has an invalid local header"), false
+    }
+    if comp != uncomp || local_comp != comp || local_uncomp != uncomp {
+        return 0, entry_msg(name, " has a bad size"), false
+    }
+    val data_at = name_at + name_len
+    val size = uncomp as usize
+    if size > data.len - data_at {
+        return 0, copy_text("archive is truncated"), false
+    }
+    val got = crc32(view_bytes(data, data_at, size))
+    if got != crc || local_crc != crc {
+        return 0, entry_msg(name, " has a bad crc"), false
+    }
+    return data_at, "", true
+}
+
+private fn fail_read(entries: list.List<Entry>, msg: str): (list.List<Entry>, str, bool) with (a: mem.Allocator) {
+    var gone = entries
+    gone.free()
+    return gone, msg, false
+}
+
+// Reads a store-only archive. On success the list holds one Entry per
+// central-directory record, in archive order, and the message is "".
+fn read(data: bytes): (list.List<Entry>, str, bool) with (a: mem.Allocator) {
+    var entries: list.List<Entry>
+    val (eocd, found) = find_eocd(data)
+    if !found {
+        return entries, copy_text("no end of central directory record"), false
+    }
+    val disk = u16_at(data, eocd + 4)
+    val disk_cd = u16_at(data, eocd + 6)
+    val count_disk = u16_at(data, eocd + 8)
+    val count = u16_at(data, eocd + 10)
+    val cd_size_u = u32_at(data, eocd + 12)
+    val cd_off_u = u32_at(data, eocd + 16)
+    if disk == 0xFFFF || disk_cd == 0xFFFF || count_disk == 0xFFFF || count == 0xFFFF || cd_size_u == 0xFFFFFFFF || cd_off_u == 0xFFFFFFFF {
+        return fail_read(entries, copy_text("zip64 archives are not supported"))
+    }
+    if disk != 0 || disk_cd != 0 || count_disk != count {
+        return fail_read(entries, copy_text("multi-disk zip archives are not supported"))
+    }
+    val cd_at = cd_off_u as usize
+    val cd_n = cd_size_u as usize
+    if cd_at > eocd || cd_n > eocd - cd_at {
+        return fail_read(entries, copy_text("central directory is outside the file"))
+    }
+    var at = cd_at
+    var seen: usize = 0
+    val nent = count as usize
+    for seen < nent {
+        if at > eocd || eocd - at < 46 {
+            return fail_read(entries, copy_text("bad central directory header"))
+        }
+        if u32_at(data, at) != 0x02014b50 {
+            return fail_read(entries, copy_text("bad central directory header"))
+        }
+        val flags = u16_at(data, at + 8)
+        val method = u16_at(data, at + 10)
+        val crc = u32_at(data, at + 16)
+        val comp = u32_at(data, at + 20)
+        val uncomp = u32_at(data, at + 24)
+        val name_len = u16_at(data, at + 28) as usize
+        val extra_len = u16_at(data, at + 30) as usize
+        val comment_len = u16_at(data, at + 32) as usize
+        val local_off = u32_at(data, at + 42) as usize
+        val name_at = at + 46
+        if name_len > eocd - name_at {
+            return fail_read(entries, copy_text("bad central directory header"))
+        }
+        val name = view_str(data, name_at, name_len)
+        if method != 0 {
+            return fail_read(entries, method_msg(name, method))
+        }
+        if flags & 0x0008 != 0 {
+            return fail_read(entries, entry_msg(name, " uses a data descriptor"))
+        }
+        if extra_len != 0 {
+            return fail_read(entries, entry_msg(name, " has an extra field"))
+        }
+        if !check_name(name) {
+            return fail_read(entries, entry_msg(name, " has an invalid name"))
+        }
+        if listed(entries, name) {
+            return fail_read(entries, entry_msg(name, " is listed twice"))
+        }
+        val after_name = name_at + name_len
+        if comment_len > eocd - after_name {
+            return fail_read(entries, copy_text("bad central directory header"))
+        }
+        val (data_at, local_msg, local_ok) = check_local(data, local_off, name, crc, comp, uncomp)
+        if !local_ok {
+            return fail_read(entries, local_msg)
+        }
+        var ent = Entry()
+        ent.name = name
+        ent.data = view_bytes(data, data_at, uncomp as usize)
+        ent.crc = crc
+        entries.push(ent)
+        at = after_name + comment_len
+        seen = seen + 1
+    }
+    if at != cd_at + cd_n {
+        return fail_read(entries, copy_text("bad central directory header"))
+    }
+    return entries, "", true
+}

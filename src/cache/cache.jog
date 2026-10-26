@@ -1,0 +1,55 @@
+// Package src.cache: the per-user cache of unpacked archives. The layout
+// and the rules are notes/Packages.md, "The cache":
+//
+//     <cache>/mod/<module>/<version>/manifest
+//     <cache>/mod/<module>/<version>/src/...
+//     <cache>/tmp/                     unpacking in progress
+//
+// <cache> is JOG_CACHE when it is set and non-empty, else
+// %LOCALAPPDATA%\jog\cache on Windows. A module folder is immutable once
+// it exists. install unpacks into a fresh folder under tmp/, verifies
+// every CRC and the content hash, then renames it into place. A folder
+// that already exists with a different hash in its manifest is an error.
+// Milestone 9 of notes/Plan.md.
+//
+// std has no mkdir, rename, or delete-folder call. std.c binds
+// CreateDirectoryA, RemoveDirectoryA, and DeleteFileA; MoveFileExA is not
+// bound, so this package declares it in a private extern block, the way
+// JogLSP's serve.jog declares _setmode. See Plan.md, milestone 9.
+//
+// Comments only, except dir.
+//
+// Sketch:
+//
+// struct ArchiveManifest {         the "manifest" entry of a .jogz
+//     archive: i64                 must be 1
+//     m: manifest.Manifest         module, version, kind, jog, require, export
+//     hash: str                    sha256:<hex>
+// }
+//
+// Signatures:
+//
+// fn module_dir(root: str, name: str, version: str): str with (a: mem.Allocator)
+//     <root>/mod/<name>/<version>
+// fn src_dir(root: str, name: str, version: str): str with (a: mem.Allocator)
+//     <root>/mod/<name>/<version>/src, the --module <dir>
+// fn has(root: str, name: str, version: str): bool with (a: mem.Allocator)
+// fn read_archive_manifest(text: str): (ArchiveManifest, bool) with (a: mem.Allocator)
+// fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allocator)
+//     zip.read, check names, CRCs, and the content hash, write under
+//     tmp/<unique>, rename to mod/<name>/<version>. A second install of
+//     the same archive is a no-op after comparing hashes.
+
+import std.fs
+import std.mem
+import std.os
+
+import src.hash
+import src.manifest
+import src.zip
+
+// The cache root. JOG_CACHE wins when it is set and non-empty. The result
+// is a new block from the Allocator.
+fn dir(): str with (a: mem.Allocator) {
+    panic("not implemented: cache.dir")
+}

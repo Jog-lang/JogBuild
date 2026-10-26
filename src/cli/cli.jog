@@ -1,0 +1,467 @@
+// Package src.cli: the command line. run reads os.argv, picks a command,
+// and returns the exit code that main passes to jogrt_exit. Exit codes
+// follow jog (notes/Packages.md, "V1 commands"): 0 on success, 1 on an
+// error, 2 on bad usage, and the compiler's or the program's own code
+// when one ran.
+//
+// parse_flags takes the arguments after the command. For run, rest is the
+// index in that slice of the first program argument after "--", or -1
+// when there was no "--".
+
+import std.arena
+import std.io
+import std.list
+import std.mem
+import std.os
+import std.strbuilder
+
+import src.cache
+import src.compiler
+import src.lockfile
+import src.manifest
+import src.pack
+import src.resolve
+import src.text
+
+struct Flags {
+    release: bool
+    release_fast: bool
+    keep_c: bool
+    target: str
+    output: str
+    all: bool
+    lib: bool
+    flags_only: bool
+    name: str
+    rest: i64
+}
+
+private fn say(to_err: bool, text: str) {
+    if to_err {
+        io.eprintln(text)
+    } else {
+        io.println(text)
+    }
+}
+
+fn usage(to_err: bool) {
+    say(to_err, "usage: jog-build <command> [arguments]")
+    say(to_err, "")
+    say(to_err, "commands:")
+    say(to_err, "  jog-build init [--lib] [name]                    write jog.mod, a root file, and .gitignore")
+    say(to_err, "  jog-build build [--release | --release-fast] [--keep-c] [--target wasm32] [-o file]")
+    say(to_err, "                                                   resolve, write jog.lock, and run jog build")
+    say(to_err, "  jog-build run [--target wasm32] [-- args...]     resolve, write jog.lock, and run jog run")
+    say(to_err, "  jog-build test [--all]                           resolve, write jog.lock, and run jog test")
+    say(to_err, "  jog-build pack [-o file]                         write out/<name>-<version>.jogz (library only)")
+    say(to_err, "  jog-build deps                                   resolve, write jog.lock, and list the modules")
+    say(to_err, "  jog-build deps --flags                           print only the --module arguments for jog")
+    say(to_err, "  jog-build help                                   show this message")
+    say(to_err, "")
+    say(to_err, "The compiler is $JOG when it is set, and jog on PATH otherwise.")
+}
+
+private fn not_yet(command: str): i32 {
+    io.eprint("jog-build ")
+    io.eprint(command)
+    io.eprintln(": not implemented yet")
+    return 1
+}
+
+private fn known(command: str): bool {
+    if command == "init" || command == "build" || command == "run" {
+        return true
+    }
+    if command == "test" || command == "pack" || command == "deps" {
+        return true
+    }
+    return false
+}
+
+private fn args_from(args: []str, start: usize): []str {
+    var view: []str
+    if start >= args.len {
+        return view
+    }
+    view.ptr = args.ptr + start
+    view.len = args.len - start
+    return view
+}
+
+// false is bad usage. The caller prints usage and returns 2.
+fn parse_flags(command: str, args: []str): (Flags, bool) {
+    var f: Flags
+    f.rest = -1
+    var i: usize = 0
+    var positionals: i64 = 0
+    for i < args.len {
+        val arg = args[i]
+        if arg == "--" {
+            if command != "run" {
+                return f, false
+            }
+            f.rest = (i + 1) as i64
+            return f, true
+        }
+        if text.starts_with(arg, "--") {
+            var (ok, next) = apply_long(command, &f, arg, args, i)
+            if !ok {
+                return f, false
+            }
+            i = next
+            continue
+        }
+        if text.starts_with(arg, "-") && arg.len > 1 {
+            var (ok, next) = apply_short(command, &f, arg, args, i)
+            if !ok {
+                return f, false
+            }
+            i = next
+            continue
+        }
+        if command != "init" {
+            return f, false
+        }
+        positionals = positionals + 1
+        if positionals > 1 {
+            return f, false
+        }
+        f.name = arg
+        i = i + 1
+    }
+    return f, true
+}
+
+private fn apply_long(command: str, f: *Flags, arg: str, args: []str, i: usize): (bool, usize) {
+    if arg == "--release" {
+        if command != "build" || f.release || f.release_fast {
+            return false, 0
+        }
+        f.release = true
+        return true, i + 1
+    }
+    if arg == "--release-fast" {
+        if command != "build" || f.release || f.release_fast {
+            return false, 0
+        }
+        f.release_fast = true
+        return true, i + 1
+    }
+    if arg == "--keep-c" {
+        if command != "build" || f.keep_c {
+            return false, 0
+        }
+        f.keep_c = true
+        return true, i + 1
+    }
+    if arg == "--all" {
+        if command != "test" || f.all {
+            return false, 0
+        }
+        f.all = true
+        return true, i + 1
+    }
+    if arg == "--lib" {
+        if command != "init" || f.lib {
+            return false, 0
+        }
+        f.lib = true
+        return true, i + 1
+    }
+    if arg == "--flags" {
+        if command != "deps" || f.flags_only {
+            return false, 0
+        }
+        f.flags_only = true
+        return true, i + 1
+    }
+    if arg == "--target" || text.starts_with(arg, "--target=") {
+        if command != "build" && command != "run" {
+            return false, 0
+        }
+        if f.target.len != 0 {
+            return false, 0
+        }
+        var value: str = ""
+        var next = i + 1
+        if text.starts_with(arg, "--target=") {
+            value = text.view_range(arg, 9, arg.len)
+        } else {
+            if i + 1 >= args.len {
+                return false, 0
+            }
+            value = args[i + 1]
+            next = i + 2
+        }
+        if value != "wasm32" {
+            return false, 0
+        }
+        f.target = value
+        return true, next
+    }
+    return false, 0
+}
+
+private fn apply_short(command: str, f: *Flags, arg: str, args: []str, i: usize): (bool, usize) {
+    if arg == "-o" {
+        if command != "build" && command != "pack" {
+            return false, 0
+        }
+        if f.output.len != 0 {
+            return false, 0
+        }
+        if i + 1 >= args.len {
+            return false, 0
+        }
+        f.output = args[i + 1]
+        return true, i + 2
+    }
+    return false, 0
+}
+
+// Milestone 11. Writes jog.mod, main.jog or <name>.jog, and .gitignore.
+fn cmd_init(f: Flags): i32 with (a: mem.Allocator) {
+    return not_yet("init")
+}
+
+private struct Loaded {
+    jog: str
+    root: str
+    graph: resolve.Graph
+}
+
+private fn load(): (Loaded, bool) with (a: mem.Allocator) {
+    var loaded: Loaded
+    var (jog, found) = compiler.find()
+    if !found {
+        io.eprintln("jog-build: compiler not found. Set JOG, or put jog.exe on PATH")
+        return loaded, false
+    }
+    loaded.jog = jog
+    var (root, rok) = resolve.module_root()
+    if !rok {
+        io.eprintln("jog-build: cannot find jog.mod")
+        return loaded, false
+    }
+    loaded.root = root
+    var (ver, vok) = compiler.version(jog)
+    if !vok {
+        io.eprintln("jog-build: cannot read the compiler version")
+        return loaded, false
+    }
+    var (g, gok) = resolve.resolve(root, ver)
+    if !gok {
+        return loaded, false
+    }
+    loaded.graph = g
+    return loaded, true
+}
+
+private fn build_in(f: Flags): i32 with (a: mem.Allocator) {
+    var (loaded, ok) = load()
+    if !ok {
+        return 1
+    }
+    var mods = compiler.module_flags(loaded.graph)
+    var extra: list.List<str>
+    var sub = "build"
+    if loaded.graph.root.library {
+        // jog check does not take the build flags. Drop them.
+        sub = "check"
+    } else {
+        if f.release {
+            extra.push("--release")
+        }
+        if f.release_fast {
+            extra.push("--release-fast")
+        }
+        if f.keep_c {
+            extra.push("--keep-c")
+        }
+        if f.target.len > 0 {
+            extra.push("--target")
+            extra.push(f.target)
+        }
+        if f.output.len > 0 {
+            extra.push("-o")
+            extra.push(f.output)
+        }
+    }
+    var argv = compiler.command(loaded.jog, sub, loaded.root, mods.slice_view(), extra.slice_view())
+    return compiler.run_jog(argv.slice_view())
+}
+
+fn cmd_build(f: Flags): i32 with (a: mem.Allocator) {
+    var ar = arena.init(0)
+    var code: i32 = 1
+    with (&ar) {
+        code = build_in(f)
+    }
+    ar.release()
+    return code
+}
+
+private fn run_in(f: Flags, args: []str): i32 with (a: mem.Allocator) {
+    var (loaded, ok) = load()
+    if !ok {
+        return 1
+    }
+    var mods = compiler.module_flags(loaded.graph)
+    var extra: list.List<str>
+    if f.target.len > 0 {
+        extra.push("--target")
+        extra.push(f.target)
+    }
+    if f.rest >= 0 {
+        extra.push("--")
+        var i = f.rest as usize
+        for i < args.len {
+            extra.push(args[i])
+            i = i + 1
+        }
+    }
+    var argv = compiler.command(loaded.jog, "run", loaded.root, mods.slice_view(), extra.slice_view())
+    return compiler.run_jog(argv.slice_view())
+}
+
+fn cmd_run(f: Flags, args: []str): i32 with (a: mem.Allocator) {
+    var ar = arena.init(0)
+    var code: i32 = 1
+    with (&ar) {
+        code = run_in(f, args)
+    }
+    ar.release()
+    return code
+}
+
+private fn test_in(f: Flags): i32 with (a: mem.Allocator) {
+    var (loaded, ok) = load()
+    if !ok {
+        return 1
+    }
+    var mods = compiler.module_flags(loaded.graph)
+    // jog test accepts a package path or --all, not both. The absolute
+    // root already loads the whole module's tests, including with --all,
+    // and it works from any directory. proc.run has no working directory.
+    var extra: list.List<str>
+    var argv = compiler.command(loaded.jog, "test", loaded.root, mods.slice_view(), extra.slice_view())
+    return compiler.run_jog(argv.slice_view())
+}
+
+fn cmd_test(f: Flags): i32 with (a: mem.Allocator) {
+    var ar = arena.init(0)
+    var code: i32 = 1
+    with (&ar) {
+        code = test_in(f)
+    }
+    ar.release()
+    return code
+}
+
+fn cmd_pack(f: Flags): i32 with (a: mem.Allocator) {
+    return not_yet("pack")
+}
+
+private fn deps_in(f: Flags): i32 with (a: mem.Allocator) {
+    var (loaded, ok) = load()
+    if !ok {
+        return 1
+    }
+    if f.flags_only {
+        var mods = compiler.module_flags(loaded.graph)
+        var i: usize = 0
+        for i + 1 < mods.len {
+            io.print("--module=")
+            io.println(mods.get(i + 1))
+            i = i + 2
+        }
+        return 0
+    }
+    var i: usize = 0
+    for i < loaded.graph.nodes.len {
+        val n = loaded.graph.nodes.get(i)
+        var line = strbuilder.empty()
+        line.append(n.name)
+        line.append(" ")
+        val ver = manifest.version_text(n.version)
+        line.append(ver)
+        text.free_str(ver)
+        line.append(" ")
+        line.append(resolve.source_name(n.source))
+        line.append(" ")
+        line.append(n.dir)
+        io.println(line.str())
+        line.free()
+        i = i + 1
+    }
+    return 0
+}
+
+fn cmd_deps(f: Flags): i32 with (a: mem.Allocator) {
+    var ar = arena.init(0)
+    var code: i32 = 1
+    with (&ar) {
+        code = deps_in(f)
+    }
+    ar.release()
+    return code
+}
+
+private fn dispatch(args: []str): i32 with (a: mem.Allocator) {
+    if args.len < 2 {
+        usage(true)
+        return 2
+    }
+    val command = args[1]
+    if command == "help" || command == "--help" || command == "-h" {
+        usage(false)
+        return 0
+    }
+    if !known(command) {
+        io.eprint("jog-build: unknown command '")
+        io.eprint(command)
+        io.eprintln("'")
+        usage(true)
+        return 2
+    }
+    val tail = args_from(args, 2)
+    var (f, ok) = parse_flags(command, tail)
+    if !ok {
+        usage(true)
+        return 2
+    }
+    if command == "init" {
+        return cmd_init(f)
+    }
+    if command == "build" {
+        return cmd_build(f)
+    }
+    if command == "run" {
+        return cmd_run(f, tail)
+    }
+    if command == "test" {
+        return cmd_test(f)
+    }
+    if command == "pack" {
+        return cmd_pack(f)
+    }
+    return cmd_deps(f)
+}
+
+fn run(): i32 with (a: mem.Allocator) {
+    var args: list.List<str>
+    var i: i64 = 0
+    val n = os.argc()
+    for i < n {
+        args.push(text.copy_str(os.argv(i)))
+        i = i + 1
+    }
+    val code = dispatch(args.slice_view())
+    var k: usize = 0
+    for k < args.len {
+        text.free_str(args.get(k))
+        k = k + 1
+    }
+    args.free()
+    return code
+}

@@ -1,0 +1,1 @@
+jog.mod:2:8: error: jog.mod: only a library can export packages; add 'kind library'

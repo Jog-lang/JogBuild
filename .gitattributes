@@ -1,0 +1,3 @@
+# testdata is compared byte for byte: content hashes, jog.lock output, and
+# error columns all change if git converts line endings on checkout.
+testdata/** -text

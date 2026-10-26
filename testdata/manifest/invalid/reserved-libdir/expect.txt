@@ -1,0 +1,1 @@
+jog.mod:2:1: error: jog.mod: 'libdir' is reserved for a later version

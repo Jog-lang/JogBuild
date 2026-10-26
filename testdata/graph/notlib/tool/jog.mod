@@ -1,0 +1,2 @@
+module tool
+kind executable

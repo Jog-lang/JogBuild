@@ -1,0 +1,9 @@
+archive 1
+module sdl
+version 0.2.1
+kind library
+jog 0.0.1
+require mathx 1.2.0
+export video
+export events
+hash sha256:41ab07...

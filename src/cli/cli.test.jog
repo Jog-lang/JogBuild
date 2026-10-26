@@ -1,0 +1,170 @@
+import std.list
+import std.mem
+import std.testing
+
+@test
+fn build_accepts_its_flags() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--release")
+        args.push("--keep-c")
+        args.push("--target")
+        args.push("wasm32")
+        args.push("-o")
+        args.push("out.exe")
+        var (f, ok) = parse_flags("build", args.slice_view())
+        t.expect(ok)
+        t.expect(f.release)
+        t.expect(!f.release_fast)
+        t.expect(f.keep_c)
+        t.expect(f.target == "wasm32")
+        t.expect(f.output == "out.exe")
+        t.expect(f.rest == -1)
+        args.free()
+        var eq: list.List<str>
+        eq.push("--target=wasm32")
+        var (g, gok) = parse_flags("build", eq.slice_view())
+        t.expect(gok)
+        t.expect(g.target == "wasm32")
+        eq.free()
+    }
+}
+
+@test
+fn run_accepts_target_and_program_args() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--target=wasm32")
+        args.push("--")
+        args.push("--release")
+        args.push("file.jog")
+        var (f, ok) = parse_flags("run", args.slice_view())
+        t.expect(ok)
+        t.expect(f.target == "wasm32")
+        t.expect(f.rest == 2)
+        t.expect(args.get(f.rest as usize) == "--release")
+        args.free()
+    }
+}
+
+@test
+fn test_accepts_all() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--all")
+        var (f, ok) = parse_flags("test", args.slice_view())
+        t.expect(ok)
+        t.expect(f.all)
+        args.free()
+    }
+}
+
+@test
+fn pack_accepts_output() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("-o")
+        args.push("lib.jogz")
+        var (f, ok) = parse_flags("pack", args.slice_view())
+        t.expect(ok)
+        t.expect(f.output == "lib.jogz")
+        args.free()
+    }
+}
+
+@test
+fn deps_flags_sets_flags_only() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--flags")
+        var (f, ok) = parse_flags("deps", args.slice_view())
+        t.expect(ok)
+        t.expect(f.flags_only)
+        args.free()
+        var bare: list.List<str>
+        var (g, gok) = parse_flags("deps", bare.slice_view())
+        t.expect(gok)
+        t.expect(!g.flags_only)
+        bare.free()
+    }
+}
+
+@test
+fn init_accepts_lib_and_name() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--lib")
+        args.push("shapes")
+        var (f, ok) = parse_flags("init", args.slice_view())
+        t.expect(ok)
+        t.expect(f.lib)
+        t.expect(f.name == "shapes")
+        args.free()
+    }
+}
+
+@test
+fn both_release_modes_are_bad_usage() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--release")
+        args.push("--release-fast")
+        var (f, ok) = parse_flags("build", args.slice_view())
+        t.expect(!ok)
+        args.free()
+    }
+}
+
+@test
+fn test_rejects_a_positional() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--all")
+        args.push("extra")
+        var (f, ok) = parse_flags("test", args.slice_view())
+        t.expect(!ok)
+        args.free()
+    }
+}
+
+@test
+fn run_keeps_dash_release_as_a_program_argument() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--")
+        args.push("--release")
+        var (f, ok) = parse_flags("run", args.slice_view())
+        t.expect(ok)
+        t.expect(f.rest == 1)
+        t.expect(args.get(1) == "--release")
+        args.free()
+    }
+}
+
+@test
+fn unknown_flag_missing_value_and_bad_target() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var bogus: list.List<str>
+        bogus.push("--bogus")
+        var (a, aok) = parse_flags("build", bogus.slice_view())
+        t.expect(!aok)
+        bogus.free()
+        var missing: list.List<str>
+        missing.push("-o")
+        var (b, bok) = parse_flags("build", missing.slice_view())
+        t.expect(!bok)
+        missing.free()
+        var target: list.List<str>
+        target.push("--target")
+        target.push("native")
+        var (c, cok) = parse_flags("build", target.slice_view())
+        t.expect(!cok)
+        target.free()
+        var second: list.List<str>
+        second.push("one")
+        second.push("two")
+        var (d, dok) = parse_flags("init", second.slice_view())
+        t.expect(!dok)
+        second.free()
+    }
+}

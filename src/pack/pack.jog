@@ -1,0 +1,45 @@
+// Package src.pack: builds out/<name>-<version>.jogz from a library
+// module. The layout is notes/Packages.md, "Layout": a "manifest" entry
+// first, then src/<file> for every shipped file. Milestone 8 of
+// notes/Plan.md.
+//
+// Steps (notes/Packages.md, "V1 commands", pack):
+// 1. The module is kind library and has an explicit version line.
+// 2. Resolve, and run jog check with the --module flags.
+// 3. Collect files under the module root, skipping: out/, any file or
+//    folder whose name starts with ".", jog.lock, *.test.jog, and any
+//    subfolder that has its own jog.mod.
+// 4. src/jog.mod is jog.mod with every path require rewritten to
+//    "require <module> <version>", the version from that dependency's
+//    own jog.mod (or archive manifest). Every other line is copied.
+// 5. Compute the content hash over src/, write the manifest entry,
+//    write the zip, print the path and the hash.
+//
+// Comments only: every signature needs resolve.Graph or zip.Entry.
+//
+// Sketch:
+//
+// struct Collected {
+//     names: List<str>     relative to the module root, / separated, sorted
+//     data: List<bytes>    same order
+// }
+//
+// Signatures:
+//
+// fn collect(root_dir: str): (Collected, bool) with (a: mem.Allocator)
+//     fs.list is sorted but has no file or folder flag; see Plan.md,
+//     milestone 8, for telling them apart.
+// fn rewrite_jog_mod(text: str, g: resolve.Graph): str with (a: mem.Allocator)
+// fn archive_manifest(m: manifest.Manifest, hash: str): str with (a: mem.Allocator)
+// fn pack(root_dir: str, output: str, g: resolve.Graph): (str, str, bool) with (a: mem.Allocator)
+//     Returns the archive path and the content hash.
+
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder
+
+import src.hash
+import src.manifest
+import src.resolve
+import src.zip

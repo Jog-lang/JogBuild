@@ -1,0 +1,5 @@
+import c
+
+fn name(): str {
+    return c.tag()
+}

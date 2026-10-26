@@ -1,0 +1,17 @@
+// jog-build: reads jog.mod, resolves the module's dependencies, and runs
+// the compiler with one --module flag per dependency. The spec is
+// notes/Packages.md and the plan is notes/Plan.md. The work is in the
+// src.cli package; main only sets up the heap and exits with its code.
+// std.os has no exit, so the code goes through c.jogrt_exit, as in JogLSP.
+
+import src.cli
+import std.c
+import std.mem
+
+fn main() {
+    var code: i32 = 0
+    with (mem.heap()) {
+        code = cli.run()
+    }
+    c.jogrt_exit(code)
+}

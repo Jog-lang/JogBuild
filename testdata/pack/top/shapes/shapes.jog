@@ -1,0 +1,3 @@
+fn logo_len(): usize {
+    return @embed("../assets/logo.txt").len
+}

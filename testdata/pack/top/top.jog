@@ -1,0 +1,5 @@
+import base
+
+fn base_name(): str {
+    return base.name()
+}

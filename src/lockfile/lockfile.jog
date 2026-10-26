@@ -1,0 +1,34 @@
+// Package src.lockfile: jog.lock, written next to jog.mod by build, run,
+// test, pack, and deps. The format is notes/Packages.md, "jog.lock":
+// "lock 1" first, then one dep line per module except the root, sorted by
+// module name, one space between fields, "\n" after every line, no
+// timestamps, no absolute paths. The file is rewritten only when its
+// bytes change. Milestone 10 of notes/Plan.md.
+//
+// Comments only: every signature needs resolve.Graph, which is a sketch.
+//
+// Sketch:
+//
+// struct Entry {
+//     module: str
+//     version: str         as text, e.g. 0.2.0
+//     source: str          path, archive, or cache
+//     location: str        the require spec as written, with / separators,
+//                          or "-" for cache
+//     hash: str            sha256:<hex>, or "-" for path
+// }
+//
+// Signatures:
+//
+// fn entries(g: resolve.Graph): List<Entry> with (a: mem.Allocator)
+//     Sorted by module name, byte order.
+// fn format(entries: []Entry): str with (a: mem.Allocator)
+// fn write_if_changed(path: str, text: str): bool with (a: mem.Allocator)
+//     fs.read_all the old file; fs.write_all only when the bytes differ.
+// fn parse(text: str): (List<Entry>, bool) with (a: mem.Allocator)
+//     Not needed in V1, which only writes the file. Useful for tests.
+
+import std.fs
+import std.list
+import std.mem
+import std.strbuilder

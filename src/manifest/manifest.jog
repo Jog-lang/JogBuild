@@ -1,0 +1,870 @@
+// Package src.manifest: the jog.mod v2 parser and semantic versions.
+// The format is notes/Packages.md, "jog.mod v2". Line and column match
+// jog check. Numbers stay digit strings so a version longer than i64
+// still parses. format writes the normal form in notes/Plan.md.
+
+import std.list
+import std.mem
+import std.strbuilder
+
+import src.text
+
+struct Version {
+    major: str
+    minor: str
+    patch: str
+    pre: str
+}
+
+struct Pos {
+    line: i64
+    col: i64
+}
+
+struct Require {
+    module: str
+    spec: str
+    is_path: bool
+    version: Version
+    pos: Pos
+}
+
+struct Link {
+    lib: str
+    target: str
+}
+
+struct Manifest {
+    module: str
+    version: Version
+    has_version: bool
+    has_kind: bool
+    library: bool
+    jog: Version
+    has_jog: bool
+    name_line: i64
+    name_col: i64
+    jog_line: i64
+    jog_col: i64
+    requires: list.List<Require>
+    exports: list.List<str>
+    links: list.List<Link>
+}
+
+struct ParseError {
+    pos: Pos
+    message: str
+}
+
+private struct Word {
+    text: str
+    col: i64
+}
+
+private struct Scan {
+    saw_module: bool
+    saw_version: bool
+    saw_kind: bool
+    saw_jog: bool
+    any_export: bool
+    export_line: i64
+    export_col: i64
+}
+
+private fn is_digit(c: u8): bool {
+    return c >= '0' as u8 && c <= '9' as u8
+}
+
+private fn is_letter(c: u8): bool {
+    if c >= 'a' as u8 && c <= 'z' as u8 {
+        return true
+    }
+    return c >= 'A' as u8 && c <= 'Z' as u8
+}
+
+private fn is_ident_start(c: u8): bool {
+    return is_letter(c) || c == '_' as u8
+}
+
+private fn is_ident_char(c: u8): bool {
+    return is_ident_start(c) || is_digit(c)
+}
+
+fn is_ident(word: str): bool {
+    if word.len == 0 || !is_ident_start(word.ptr[0]) {
+        return false
+    }
+    var i: usize = 1
+    for i < word.len {
+        if !is_ident_char(word.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn all_digits(text: str): bool {
+    if text.len == 0 {
+        return false
+    }
+    var i: usize = 0
+    for i < text.len {
+        if !is_digit(text.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn numeric_ident(text: str): bool {
+    if !all_digits(text) {
+        return false
+    }
+    return text.len == 1 || text.ptr[0] != '0' as u8
+}
+
+fn is_path_spec(spec: str): bool {
+    if spec.len >= 1 {
+        val c = spec.ptr[0]
+        if c == '/' as u8 || c == '\\' as u8 {
+            return true
+        }
+    }
+    if spec.len >= 2 && spec.ptr[0] == '.' as u8 && spec.ptr[1] == '/' as u8 {
+        return true
+    }
+    if spec.len >= 3 && spec.ptr[0] == '.' as u8 && spec.ptr[1] == '.' as u8 && spec.ptr[2] == '/' as u8 {
+        return true
+    }
+    if spec.len >= 2 && spec.ptr[1] == ':' as u8 && is_letter(spec.ptr[0]) {
+        return true
+    }
+    return false
+}
+
+private fn is_dotted_path(word: str): bool {
+    if word.len == 0 {
+        return false
+    }
+    var start: usize = 0
+    var i: usize = 0
+    for i < word.len {
+        if word.ptr[i] == '.' as u8 {
+            if !is_ident(text.view_range(word, start, i)) {
+                return false
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return is_ident(text.view_range(word, start, word.len))
+}
+
+fn parse_version(word: str): (Version, bool) {
+    var v: Version
+    var i: usize = 0
+    var part: i64 = 0
+    for part < 3 {
+        val start = i
+        for i < word.len {
+            if !is_digit(word.ptr[i]) {
+                break
+            }
+            i = i + 1
+        }
+        val ident = text.view_range(word, start, i)
+        if !numeric_ident(ident) {
+            return v, false
+        }
+        if part == 0 {
+            v.major = ident
+        } else if part == 1 {
+            v.minor = ident
+        } else {
+            v.patch = ident
+        }
+        if part < 2 {
+            if i >= word.len || word.ptr[i] != '.' as u8 {
+                return v, false
+            }
+            i = i + 1
+        }
+        part = part + 1
+    }
+    if i == word.len {
+        return v, true
+    }
+    if word.ptr[i] != '-' as u8 {
+        return v, false
+    }
+    i = i + 1
+    val pre_start = i
+    for {
+        val start = i
+        for i < word.len {
+            if word.ptr[i] == '.' as u8 {
+                break
+            }
+            val c = word.ptr[i]
+            if !is_digit(c) && !is_letter(c) && c != '-' as u8 {
+                return v, false
+            }
+            i = i + 1
+        }
+        val id = text.view_range(word, start, i)
+        if id.len == 0 || (all_digits(id) && !numeric_ident(id)) {
+            return v, false
+        }
+        if i == word.len {
+            v.pre = text.view_range(word, pre_start, word.len)
+            return v, true
+        }
+        i = i + 1
+    }
+}
+
+private fn cmp_bytes(a: str, b: str): i32 {
+    var n = a.len
+    if b.len < n {
+        n = b.len
+    }
+    var i: usize = 0
+    for i < n {
+        if a.ptr[i] < b.ptr[i] {
+            return -1
+        }
+        if a.ptr[i] > b.ptr[i] {
+            return 1
+        }
+        i = i + 1
+    }
+    if a.len == b.len {
+        return 0
+    }
+    if a.len < b.len {
+        return -1
+    }
+    return 1
+}
+
+private fn cmp_numeric(a: str, b: str): i32 {
+    if a.len < b.len {
+        return -1
+    }
+    if a.len > b.len {
+        return 1
+    }
+    return cmp_bytes(a, b)
+}
+
+private fn cmp_pre(a: str, b: str): i32 {
+    if a.len == 0 && b.len == 0 {
+        return 0
+    }
+    if a.len == 0 {
+        return 1
+    }
+    if b.len == 0 {
+        return -1
+    }
+    var ai: usize = 0
+    var bi: usize = 0
+    for {
+        val a_start = ai
+        val b_start = bi
+        for ai < a.len {
+            if a.ptr[ai] == '.' as u8 {
+                break
+            }
+            ai = ai + 1
+        }
+        for bi < b.len {
+            if b.ptr[bi] == '.' as u8 {
+                break
+            }
+            bi = bi + 1
+        }
+        val a_id = text.view_range(a, a_start, ai)
+        val b_id = text.view_range(b, b_start, bi)
+        val a_num = all_digits(a_id)
+        val b_num = all_digits(b_id)
+        var c: i32 = 0
+        if a_num && b_num {
+            c = cmp_numeric(a_id, b_id)
+        } else if a_num != b_num {
+            if a_num {
+                c = -1
+            } else {
+                c = 1
+            }
+        } else {
+            c = cmp_bytes(a_id, b_id)
+        }
+        if c != 0 {
+            return c
+        }
+        val a_more = ai < a.len
+        val b_more = bi < b.len
+        if !a_more || !b_more {
+            if a_more == b_more {
+                return 0
+            }
+            if a_more {
+                return 1
+            }
+            return -1
+        }
+        ai = ai + 1
+        bi = bi + 1
+    }
+}
+
+fn compare_versions(x: Version, y: Version): i32 {
+    var c = cmp_numeric(x.major, y.major)
+    if c != 0 {
+        return c
+    }
+    c = cmp_numeric(x.minor, y.minor)
+    if c != 0 {
+        return c
+    }
+    c = cmp_numeric(x.patch, y.patch)
+    if c != 0 {
+        return c
+    }
+    return cmp_pre(x.pre, y.pre)
+}
+
+fn accepts(need: Version, have: Version): bool {
+    return compare_versions(have, need) >= 0
+}
+
+fn copy_version(v: Version): Version with (a: mem.Allocator) {
+    var o: Version
+    o.major = text.copy_str(v.major)
+    o.minor = text.copy_str(v.minor)
+    o.patch = text.copy_str(v.patch)
+    o.pre = text.copy_str(v.pre)
+    return o
+}
+
+private fn zero_version(): Version with (a: mem.Allocator) {
+    var v: Version
+    v.major = text.copy_str("0")
+    v.minor = text.copy_str("0")
+    v.patch = text.copy_str("0")
+    return v
+}
+
+fn append_version(b: *strbuilder.StrBuilder, v: Version) with (a: mem.Allocator) {
+    b.append(v.major)
+    b.append(".")
+    b.append(v.minor)
+    b.append(".")
+    b.append(v.patch)
+    if v.pre.len > 0 {
+        b.append("-")
+        b.append(v.pre)
+    }
+}
+
+fn version_text(v: Version): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    if v.major.len == 0 {
+        b.append("0.0.0")
+    } else {
+        append_version(&b, v)
+    }
+    val text = text.copy_str(b.str())
+    b.free()
+    return text
+}
+
+private fn free_version(v: *Version) with (a: mem.Allocator) {
+    text.free_str(v.major)
+    text.free_str(v.minor)
+    text.free_str(v.patch)
+    text.free_str(v.pre)
+}
+
+fn free(m: *Manifest) with (a: mem.Allocator) {
+    text.free_str(m.module)
+    free_version(&m.version)
+    free_version(&m.jog)
+    var i: usize = 0
+    for i < m.requires.len {
+        var r = m.requires.get(i)
+        text.free_str(r.module)
+        text.free_str(r.spec)
+        free_version(&r.version)
+        i = i + 1
+    }
+    m.requires.free()
+    i = 0
+    for i < m.exports.len {
+        text.free_str(m.exports.get(i))
+        i = i + 1
+    }
+    m.exports.free()
+    i = 0
+    for i < m.links.len {
+        var link = m.links.get(i)
+        text.free_str(link.lib)
+        text.free_str(link.target)
+        i = i + 1
+    }
+    m.links.free()
+}
+
+private fn with_word(before: str, word: str, after: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append(before)
+    b.append(word)
+    b.append(after)
+    val text = text.copy_str(b.str())
+    b.free()
+    return text
+}
+
+private fn tokenize(line: str): list.List<Word> with (a: mem.Allocator) {
+    var words: list.List<Word>
+    var i: usize = 0
+    for i < line.len {
+        val c = line.ptr[i]
+        if c == ' ' as u8 || c == '\t' as u8 {
+            i = i + 1
+            continue
+        }
+        if c == '#' as u8 {
+            break
+        }
+        val start = i
+        for i < line.len {
+            val d = line.ptr[i]
+            if d == ' ' as u8 || d == '\t' as u8 || d == '#' as u8 {
+                break
+            }
+            i = i + 1
+        }
+        var w: Word
+        w.text = text.view_range(line, start, i)
+        w.col = (start as i64) + 1
+        words.push(w)
+    }
+    return words
+}
+
+private fn fail(err: *ParseError, line: i64, col: i64, message: str): bool {
+    err.pos.line = line
+    err.pos.col = col
+    err.message = message
+    return false
+}
+
+private fn one_word(words: list.List<Word>, missing: str, extra: str, err: *ParseError, line_no: i64): bool {
+    if words.len < 2 {
+        return fail(err, line_no, words.get(0).col, missing)
+    }
+    if words.len > 2 {
+        return fail(err, line_no, words.get(2).col, extra)
+    }
+    return true
+}
+
+private fn name_eq(words: list.List<Word>, i: usize, literal: str): bool {
+    return words.get(i).text == literal
+}
+
+private fn reserved_base(word: str): bool {
+    if word == "libdir" || word == "source" || word == "replace" || word == "config" {
+        return true
+    }
+    if word == "include" || word == "exclude" || word == "provides" || word == "needs" {
+        return true
+    }
+    return false
+}
+
+private fn known_base(word: str): bool {
+    if word == "module" || word == "version" || word == "kind" || word == "jog" {
+        return true
+    }
+    return word == "require" || word == "export" || word == "link"
+}
+
+private fn base_before_dot(word: str): str {
+    var i: usize = 0
+    for i < word.len {
+        if word.ptr[i] == '.' as u8 {
+            return text.view_range(word, 0, i)
+        }
+        i = i + 1
+    }
+    return word
+}
+
+private fn has_dot(word: str): bool {
+    return text.index_of(word, '.' as u8) >= 0
+}
+
+private fn is_reserved(word: str): bool {
+    val base = base_before_dot(word)
+    if reserved_base(base) {
+        return true
+    }
+    return has_dot(word) && known_base(base)
+}
+
+private fn is_link_word(word: str): bool {
+    if word == "link" {
+        return true
+    }
+    return text.starts_with(word, "link.") && word.len > 5
+}
+
+private fn dup_require(m: *Manifest, name: str): bool {
+    var i: usize = 0
+    for i < m.requires.len {
+        if m.requires.get(i).module == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn dup_export(m: *Manifest, name: str): bool {
+    var i: usize = 0
+    for i < m.exports.len {
+        if m.exports.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn apply_module(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
+    val pos = words.get(0).col
+    if st.saw_module {
+        return fail(err, line_no, pos, "jog.mod: duplicate module declaration")
+    }
+    if st.saw_version || st.saw_kind || st.saw_jog || m.requires.len > 0 || m.exports.len > 0 || m.links.len > 0 {
+        return fail(err, line_no, pos, "jog.mod: module name must be the first declaration")
+    }
+    if words.len < 2 {
+        return fail(err, line_no, pos, "jog.mod: missing module name")
+    }
+    if words.len > 2 {
+        return fail(err, line_no, words.get(2).col, "jog.mod: extra tokens after the module name")
+    }
+    val name = words.get(1).text
+    val ncol = words.get(1).col
+    if !is_ident(name) {
+        return fail(err, line_no, ncol, with_word("jog.mod: module name '", name, "' is not an identifier"))
+    }
+    if name == "std" {
+        return fail(err, line_no, ncol, "jog.mod: module name 'std' is reserved for the standard library")
+    }
+    m.module = text.copy_str(name)
+    m.name_line = line_no
+    m.name_col = ncol
+    st.saw_module = true
+    return true
+}
+
+private fn apply_link(m: *Manifest, words: list.List<Word>, line_no: i64, err: *ParseError): bool with (a: mem.Allocator) {
+    val first = words.get(0)
+    var target: str = ""
+    if first.text != "link" {
+        val tcol = first.col + 5
+        target = text.view_range(first.text, 5, first.text.len)
+        if target != "windows" && target != "linux" && target != "macos" {
+            return fail(err, line_no, tcol, with_word("jog.mod: unknown target '", target, "'; expected windows, linux, or macos"))
+        }
+    }
+    if !one_word(words, "jog.mod: missing library name", "jog.mod: extra tokens after the library name", err, line_no) {
+        return false
+    }
+    var link: Link
+    link.lib = text.copy_str(words.get(1).text)
+    link.target = text.copy_str(target)
+    m.links.push(link)
+    return true
+}
+
+private fn apply_version(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
+    if st.saw_version {
+        return fail(err, line_no, words.get(0).col, "jog.mod: duplicate version declaration")
+    }
+    if !one_word(words, "jog.mod: missing version", "jog.mod: extra tokens after the version", err, line_no) {
+        return false
+    }
+    val word = words.get(1)
+    var (v, ok) = parse_version(word.text)
+    if !ok {
+        return fail(err, line_no, word.col, with_word("jog.mod: '", word.text, "' is not a version; expected MAJOR.MINOR.PATCH"))
+    }
+    m.version = copy_version(v)
+    m.has_version = true
+    st.saw_version = true
+    return true
+}
+
+private fn apply_kind(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
+    if st.saw_kind {
+        return fail(err, line_no, words.get(0).col, "jog.mod: duplicate kind declaration")
+    }
+    if !one_word(words, "jog.mod: missing kind", "jog.mod: extra tokens after the kind", err, line_no) {
+        return false
+    }
+    val word = words.get(1)
+    if word.text == "library" {
+        m.library = true
+    } else if word.text != "executable" {
+        return fail(err, line_no, word.col, with_word("jog.mod: unknown kind '", word.text, "'; expected executable or library"))
+    }
+    m.has_kind = true
+    st.saw_kind = true
+    return true
+}
+
+private fn apply_jog(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
+    if st.saw_jog {
+        return fail(err, line_no, words.get(0).col, "jog.mod: duplicate jog declaration")
+    }
+    if !one_word(words, "jog.mod: missing compiler version", "jog.mod: extra tokens after the compiler version", err, line_no) {
+        return false
+    }
+    val word = words.get(1)
+    var (v, ok) = parse_version(word.text)
+    if !ok {
+        return fail(err, line_no, word.col, with_word("jog.mod: '", word.text, "' is not a version; expected MAJOR.MINOR.PATCH"))
+    }
+    m.jog = copy_version(v)
+    m.has_jog = true
+    m.jog_line = line_no
+    m.jog_col = word.col
+    st.saw_jog = true
+    return true
+}
+
+private fn apply_require(m: *Manifest, words: list.List<Word>, line_no: i64, err: *ParseError): bool with (a: mem.Allocator) {
+    if words.len < 2 {
+        return fail(err, line_no, words.get(0).col, "jog.mod: missing module name")
+    }
+    val name = words.get(1)
+    if !is_ident(name.text) {
+        return fail(err, line_no, name.col, with_word("jog.mod: module name '", name.text, "' is not an identifier"))
+    }
+    if words.len < 3 {
+        return fail(err, line_no, name.col, with_word("jog.mod: missing the path or version of module '", name.text, "'"))
+    }
+    if words.len > 3 {
+        return fail(err, line_no, words.get(3).col, "jog.mod: extra tokens after the path or version")
+    }
+    if name.text == "std" {
+        return fail(err, line_no, name.col, "jog.mod: std is built in and cannot be required")
+    }
+    if name.text == m.module {
+        return fail(err, line_no, name.col, with_word("jog.mod: module '", m.module, "' cannot require itself"))
+    }
+    if dup_require(m, name.text) {
+        return fail(err, line_no, name.col, with_word("jog.mod: module '", name.text, "' is required twice"))
+    }
+    val spec = words.get(2)
+    val path = is_path_spec(spec.text)
+    var ver: Version
+    if !path {
+        var (parsed, ok) = parse_version(spec.text)
+        if !ok {
+            return fail(err, line_no, spec.col, with_word("jog.mod: '", spec.text, "' is neither a path nor a version"))
+        }
+        ver = copy_version(parsed)
+    }
+    var req: Require
+    req.module = text.copy_str(name.text)
+    req.spec = text.copy_str(spec.text)
+    req.is_path = path
+    req.version = ver
+    req.pos.line = line_no
+    req.pos.col = name.col
+    m.requires.push(req)
+    return true
+}
+
+private fn apply_export(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
+    if !one_word(words, "jog.mod: missing package path", "jog.mod: extra tokens after the package path", err, line_no) {
+        return false
+    }
+    val path = words.get(1)
+    if !is_dotted_path(path.text) || path.text == "std" || text.starts_with(path.text, "std.") {
+        return fail(err, line_no, path.col, with_word("jog.mod: export '", path.text, "' is not a package path of this module"))
+    }
+    if dup_export(m, path.text) {
+        return fail(err, line_no, path.col, with_word("jog.mod: package '", path.text, "' is exported twice"))
+    }
+    m.exports.push(text.copy_str(path.text))
+    if !st.any_export {
+        st.any_export = true
+        st.export_line = line_no
+        st.export_col = path.col
+    }
+    return true
+}
+
+private fn apply(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < words.len {
+        val w = words.get(i)
+        if w.text.len > 0 && w.text.ptr[0] == '"' as u8 {
+            return fail(err, line_no, w.col, "jog.mod: quoted words are reserved for a later version")
+        }
+        i = i + 1
+    }
+    val first = words.get(0).text
+    if first == "module" {
+        return apply_module(m, words, line_no, st, err)
+    }
+    if !st.saw_module {
+        return fail(err, line_no, words.get(0).col, "jog.mod: expected 'module <name>' as the first declaration")
+    }
+    if is_link_word(first) {
+        return apply_link(m, words, line_no, err)
+    }
+    if first == "version" {
+        return apply_version(m, words, line_no, st, err)
+    }
+    if first == "kind" {
+        return apply_kind(m, words, line_no, st, err)
+    }
+    if first == "jog" {
+        return apply_jog(m, words, line_no, st, err)
+    }
+    if first == "require" {
+        return apply_require(m, words, line_no, err)
+    }
+    if first == "export" {
+        return apply_export(m, words, line_no, st, err)
+    }
+    if is_reserved(first) {
+        return fail(err, line_no, words.get(0).col, with_word("jog.mod: '", first, "' is reserved for a later version"))
+    }
+    return fail(err, line_no, words.get(0).col, with_word("jog.mod: unknown declaration '", first, "'"))
+}
+
+fn parse(src: str): (Manifest, ParseError, bool) with (a: mem.Allocator) {
+    var m: Manifest
+    var err: ParseError
+    var st: Scan
+    var at: usize = 0
+    var line_no: i64 = 1
+    for at < src.len {
+        val line_start = at
+        for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
+            at = at + 1
+        }
+        val line = text.view_range(src, line_start, at)
+        if at < src.len && src.ptr[at] == '\r' as u8 {
+            at = at + 1
+        }
+        if at < src.len && src.ptr[at] == '\n' as u8 {
+            at = at + 1
+        }
+        var words = tokenize(line)
+        if words.len == 0 {
+            words.free()
+            line_no = line_no + 1
+            continue
+        }
+        val ok = apply(&m, words, line_no, &st, &err)
+        words.free()
+        if !ok {
+            free(&m)
+            var blank: Manifest
+            return blank, err, false
+        }
+        line_no = line_no + 1
+    }
+    if !st.saw_module {
+        free(&m)
+        var blank: Manifest
+        return blank, err_simple(1, 1, "jog.mod: missing module name"), false
+    }
+    if st.any_export && !m.library {
+        free(&m)
+        var blank: Manifest
+        return blank, err_simple(st.export_line, st.export_col, "jog.mod: only a library can export packages; add 'kind library'"), false
+    }
+    if !m.has_version {
+        m.version = zero_version()
+    }
+    return m, err, true
+}
+
+private fn err_simple(line: i64, col: i64, message: str): ParseError {
+    var err: ParseError
+    err.pos.line = line
+    err.pos.col = col
+    err.message = message
+    return err
+}
+
+fn format(m: Manifest): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("module ")
+    b.append(m.module)
+    b.append("\n")
+    if m.has_version {
+        b.append("version ")
+        append_version(&b, m.version)
+        b.append("\n")
+    }
+    if m.has_kind {
+        if m.library {
+            b.append("kind library\n")
+        } else {
+            b.append("kind executable\n")
+        }
+    }
+    if m.has_jog {
+        b.append("jog ")
+        append_version(&b, m.jog)
+        b.append("\n")
+    }
+    var i: usize = 0
+    for i < m.requires.len {
+        val r = m.requires.get(i)
+        b.append("require ")
+        b.append(r.module)
+        b.append(" ")
+        b.append(r.spec)
+        b.append("\n")
+        i = i + 1
+    }
+    i = 0
+    for i < m.exports.len {
+        b.append("export ")
+        b.append(m.exports.get(i))
+        b.append("\n")
+        i = i + 1
+    }
+    i = 0
+    for i < m.links.len {
+        val link = m.links.get(i)
+        b.append("link")
+        if link.target.len > 0 {
+            b.append(".")
+            b.append(link.target)
+        }
+        b.append(" ")
+        b.append(link.lib)
+        b.append("\n")
+        i = i + 1
+    }
+    val text = text.copy_str(b.str())
+    b.free()
+    return text
+}

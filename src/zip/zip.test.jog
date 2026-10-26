@@ -1,0 +1,584 @@
+// Package src.zip. CRC-32, the store-only writer, and the reader.
+// Rejection archives are a good zip with a few bytes patched. The
+// Windows checks shell out to tar and PowerShell 7; proc.run does not
+// search PATH, so the executables are absolute.
+
+import std.c
+import std.fs
+import std.io
+import std.list
+import std.mem
+import std.os
+import std.proc
+import std.strbuilder
+import std.testing
+
+private fn text_bytes(text: str): bytes {
+    var data = bytes()
+    data.ptr = text.ptr as *u8
+    data.len = text.len
+    return data
+}
+
+private fn free_bytes(data: bytes) with (a: mem.Allocator) {
+    a.free(data)
+}
+
+private fn same_bytes(left: bytes, right: bytes): bool {
+    if left.len != right.len {
+        return false
+    }
+    var i: usize = 0
+    for i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn push_entry(xs: *list.List<Entry>, name: str, data: str) with (a: mem.Allocator) {
+    var e = Entry()
+    e.name = name
+    e.data = text_bytes(data)
+    e.crc = 0
+    xs.push(e)
+}
+
+private fn archive_one(name: str, data: str): bytes with (a: mem.Allocator) {
+    var xs: list.List<Entry>
+    push_entry(&xs, name, data)
+    val out = write(xs.slice_view())
+    xs.free()
+    return out
+}
+
+// read returns the list by value. A val cannot call free, so copy the
+// header into a var. The block is freed once.
+private fn release(entries: list.List<Entry>) with (a: mem.Allocator) {
+    var gone = entries
+    gone.free()
+}
+
+private fn expect_reject(data: bytes, want: str) with (t: testing.Testing, a: mem.Allocator) {
+    val (entries, msg, ok) = read(data)
+    release(entries)
+    if ok {
+        t.fail("expected rejection\n")
+        return
+    }
+    if msg != want {
+        io.eprint("got ")
+        io.eprint(msg)
+        io.eprint("\nwant ")
+        io.eprint(want)
+        io.eprint("\n")
+        t.fail("wrong message\n")
+    }
+    free_text(msg)
+}
+
+private fn write_text_at(data: bytes, at: usize, text: str) {
+    var i: usize = 0
+    for i < text.len {
+        data.ptr[at + i] = text.ptr[i]
+        i = i + 1
+    }
+}
+
+private fn set_u16(data: bytes, at: usize, v: u32) {
+    data.ptr[at] = (v & 0xFF) as u8
+    data.ptr[at + 1] = ((v >> 8) & 0xFF) as u8
+}
+
+private fn set_u32(data: bytes, at: usize, v: u32) {
+    set_u16(data, at, v & 0xFFFF)
+    set_u16(data, at + 2, v >> 16)
+}
+
+// Placeholder of n 'x' bytes, same length as the bad name it will become.
+private fn xs(n: usize): str with (a: mem.Allocator) {
+    var sb = strbuilder.empty()
+    var i: usize = 0
+    for i < n {
+        sb.append_byte('x' as u8)
+        i = i + 1
+    }
+    val text = copy_text(sb.str())
+    sb.free()
+    return text
+}
+
+private fn patch_name(data: bytes, name_len: usize, data_len: usize, bad: str) {
+    val central = 30 + name_len + data_len
+    write_text_at(data, 30, bad)
+    write_text_at(data, central + 46, bad)
+}
+
+@test
+fn crc32Values() with (t: testing.Testing) {
+    var empty = bytes()
+    t.expect(crc32(empty) == 0)
+    t.expect(crc32(text_bytes("123456789")) == 0xCBF43926)
+    val x = text_bytes("12345")
+    val y = text_bytes("6789")
+    t.expect(crc32_update(crc32(x), y) == crc32(text_bytes("123456789")))
+    t.expect(crc32_update(0, text_bytes("123456789")) == 0xCBF43926)
+    t.expect(crc32_update(crc32(x), empty) == crc32(x))
+    t.expect(crc_table[1] == 0x77073096)
+    t.expect(crc_table[255] == 0x2D02EF8D)
+}
+
+@test
+fn names() with (t: testing.Testing) {
+    t.expect(check_name("a.txt"))
+    t.expect(check_name("src/jog.mod"))
+    t.expect(check_name("sub/a.txt"))
+    t.expect(!check_name(""))
+    t.expect(!check_name("/x"))
+    t.expect(!check_name("../x"))
+    t.expect(!check_name("a/../x"))
+    t.expect(!check_name("a/./x"))
+    t.expect(!check_name("a//b"))
+    t.expect(!check_name("a\\b"))
+    t.expect(!check_name("C:x"))
+    t.expect(!check_name("."))
+    t.expect(!check_name(".."))
+    t.expect(!check_name("a/"))
+}
+
+@test
+fn roundTrip() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var xs: list.List<Entry>
+        push_entry(&xs, "a.txt", "alpha")
+        push_entry(&xs, "sub/b.txt", "beta")
+        val arc = write(xs.slice_view())
+        val again = write(xs.slice_view())
+        t.expect(same_bytes(arc, again))
+        t.expect(u16_at(arc, 4) == 10)
+        t.expect(u16_at(arc, 6) == 0x0800)
+        t.expect(u16_at(arc, 8) == 0)
+        t.expect(u16_at(arc, 10) == 0)
+        t.expect(u16_at(arc, 12) == 0x0021)
+        t.expect(u32_at(arc, arc.len - 22) == 0x06054b50)
+        val (entries, msg, ok) = read(arc)
+        if !ok {
+            io.eprint(msg)
+            io.eprint("\n")
+            t.fail("read failed\n")
+        } else {
+            t.expect(entries.len == 2)
+            t.expect(same_text(entries.get(0).name, "a.txt"))
+            t.expect(same_bytes(entries.get(0).data, text_bytes("alpha")))
+            t.expect(entries.get(0).crc == crc32(text_bytes("alpha")))
+            t.expect(same_text(entries.get(1).name, "sub/b.txt"))
+            t.expect(same_bytes(entries.get(1).data, text_bytes("beta")))
+        }
+        release(entries)
+        free_text(msg)
+        free_bytes(arc)
+        free_bytes(again)
+        xs.free()
+    }
+}
+
+@test
+fn preservesOrder() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var xs: list.List<Entry>
+        push_entry(&xs, "b.txt", "B")
+        push_entry(&xs, "a.txt", "A")
+        val arc = write(xs.slice_view())
+        val (entries, msg, ok) = read(arc)
+        t.expect(ok)
+        t.expect(entries.len == 2)
+        t.expect(same_text(entries.get(0).name, "b.txt"))
+        t.expect(same_text(entries.get(1).name, "a.txt"))
+        release(entries)
+        free_text(msg)
+        free_bytes(arc)
+        xs.free()
+    }
+}
+
+@test
+fn emptyArchive() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var xs: list.List<Entry>
+        val arc = write(xs.slice_view())
+        val again = write(xs.slice_view())
+        t.expect(same_bytes(arc, again))
+        t.expect(arc.len == 22)
+        val (entries, msg, ok) = read(arc)
+        t.expect(ok)
+        t.expect(entries.len == 0)
+        release(entries)
+        free_text(msg)
+        free_bytes(arc)
+        free_bytes(again)
+        xs.free()
+    }
+}
+
+@test
+fn emptyEntry() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val arc = archive_one("empty.txt", "")
+        val (entries, msg, ok) = read(arc)
+        t.expect(ok)
+        t.expect(entries.len == 1)
+        t.expect(entries.get(0).data.len == 0)
+        t.expect(entries.get(0).crc == 0)
+        release(entries)
+        free_text(msg)
+        free_bytes(arc)
+    }
+}
+
+private fn reject_renamed(bad: str) with (t: testing.Testing, a: mem.Allocator) {
+    val place = xs(bad.len)
+    val arc = archive_one(place, "ok")
+    patch_name(arc, bad.len, 2, bad)
+    var sb = strbuilder.empty()
+    sb.append("entry '")
+    sb.append(bad)
+    sb.append("' has an invalid name")
+    val want = copy_text(sb.str())
+    sb.free()
+    expect_reject(arc, want)
+    free_text(want)
+    free_text(place)
+    free_bytes(arc)
+}
+
+@test
+fn rejectsDotDot() with (t: testing.Testing) {
+    with (mem.heap()) {
+        reject_renamed("../x")
+    }
+}
+
+@test
+fn rejectsAbsolute() with (t: testing.Testing) {
+    with (mem.heap()) {
+        reject_renamed("/x")
+    }
+}
+
+@test
+fn rejectsDrive() with (t: testing.Testing) {
+    with (mem.heap()) {
+        reject_renamed("C:x")
+    }
+}
+
+@test
+fn rejectsBackslash() with (t: testing.Testing) {
+    with (mem.heap()) {
+        reject_renamed("a\\b")
+    }
+}
+
+@test
+fn rejectsEmptySegment() with (t: testing.Testing) {
+    with (mem.heap()) {
+        reject_renamed("a//b")
+    }
+}
+
+@test
+fn rejectsMethod() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val arc = archive_one("a.txt", "hello")
+        val central: usize = 40
+        set_u16(arc, 8, 8)
+        set_u16(arc, central + 10, 8)
+        expect_reject(arc, "entry 'a.txt' uses compression method 8; only stored entries are supported")
+        free_bytes(arc)
+    }
+}
+
+@test
+fn rejectsCrc() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val arc = archive_one("a.txt", "hello")
+        val central: usize = 40
+        arc.ptr[central + 16] = arc.ptr[central + 16] ^ 1
+        expect_reject(arc, "entry 'a.txt' has a bad crc")
+        free_bytes(arc)
+    }
+}
+
+@test
+fn rejectsDataDescriptor() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val arc = archive_one("a.txt", "hello")
+        val central: usize = 40
+        set_u16(arc, 6, 0x0808)
+        set_u16(arc, central + 8, 0x0808)
+        expect_reject(arc, "entry 'a.txt' uses a data descriptor")
+        free_bytes(arc)
+    }
+}
+
+@test
+fn rejectsExtra() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val arc = archive_one("a.txt", "hello")
+        val central: usize = 40
+        set_u16(arc, central + 30, 4)
+        expect_reject(arc, "entry 'a.txt' has an extra field")
+        free_bytes(arc)
+    }
+}
+
+@test
+fn rejectsDuplicate() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var xs: list.List<Entry>
+        push_entry(&xs, "one", "A")
+        push_entry(&xs, "two", "B")
+        val arc = write(xs.slice_view())
+        val span: usize = 34
+        val local2 = span
+        val central = span + span
+        val central2 = central + 49
+        write_text_at(arc, local2 + 30, "one")
+        write_text_at(arc, central2 + 46, "one")
+        expect_reject(arc, "entry 'one' is listed twice")
+        free_bytes(arc)
+        xs.free()
+    }
+}
+
+@test
+fn rejectsOffset() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val arc = archive_one("a.txt", "hello")
+        set_u32(arc, arc.len - 6, 0x00FFFFFF)
+        expect_reject(arc, "central directory is outside the file")
+        free_bytes(arc)
+    }
+}
+
+@test
+fn rejectsTruncated() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val arc = archive_one("a.txt", "hello")
+        var short = arc
+        short.len = 10
+        expect_reject(short, "no end of central directory record")
+        var empty = bytes()
+        expect_reject(empty, "no end of central directory record")
+        free_bytes(arc)
+    }
+}
+
+private fn parent_dir(path: str): str {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val b = path.ptr[i]
+        if b == '/' as u8 || b == '\\' as u8 {
+            var out = bytes()
+            out.ptr = path.ptr as *u8
+            out.len = i
+            return out
+        }
+    }
+    return ""
+}
+
+private fn repo_root(): str {
+    val exe = os.argv(0)
+    return parent_dir(parent_dir(exe))
+}
+
+private fn ensure_dir(path: str) {
+    var buf: [4096]u8
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    c.memcpy(buf[..].ptr as *void, path.ptr as *const void, path.len)
+    buf[path.len] = 0
+    c.CreateDirectoryA(buf[..].ptr as *const c.char, 0)
+}
+
+private fn contains_text(hay: str, needle: str): bool {
+    if needle.len == 0 || hay.len < needle.len {
+        return false
+    }
+    var i: usize = 0
+    val last = hay.len - needle.len
+    for i <= last {
+        var ok = true
+        var j: usize = 0
+        for j < needle.len {
+            if hay.ptr[i + j] != needle.ptr[j] {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn as_text(data: bytes): str {
+    var out = bytes()
+    out.ptr = data.ptr
+    out.len = data.len
+    return out
+}
+
+private fn cmd_ok(out: proc.Output, label: str) with (t: testing.Testing) {
+    if out.ok && out.code == 0 {
+        return
+    }
+    io.eprint(label)
+    io.eprint(" failed\n")
+    io.eprint(as_text(out.stderr))
+    io.eprint(as_text(out.stdout))
+    t.fail("command failed\n")
+}
+
+@test
+fn windowsTools() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val root = repo_root()
+        val out_dir = fs.join(root, "out")
+        val test_dir = fs.join(out_dir, "test")
+        val in_dir = fs.join(test_dir, "in")
+        ensure_dir(out_dir)
+        ensure_dir(test_dir)
+        ensure_dir(in_dir)
+        val a_txt = fs.join(in_dir, "a.txt")
+        val b_txt = fs.join(in_dir, "b.txt")
+        t.expect(fs.write_all(a_txt, text_bytes("alpha")))
+        t.expect(fs.write_all(b_txt, text_bytes("beta")))
+        var xs: list.List<Entry>
+        push_entry(&xs, "a.txt", "alpha")
+        push_entry(&xs, "b.txt", "beta")
+        val arc = write(xs.slice_view())
+        val two = fs.join(test_dir, "two.zip")
+        t.expect(fs.write_all(two, arc))
+        val expanded = fs.join(test_dir, "two")
+        var expand_cmd = strbuilder.empty()
+        expand_cmd.append("Expand-Archive -Force -Path '")
+        expand_cmd.append(two)
+        expand_cmd.append("' -DestinationPath '")
+        expand_cmd.append(expanded)
+        expand_cmd.append("'")
+        val expand_text = copy_text(expand_cmd.str())
+        expand_cmd.free()
+        val pwsh = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+        val expanded_run = proc.run([]str(pwsh, "-NoProfile", "-Command", expand_text))
+        cmd_ok(expanded_run, "Expand-Archive")
+        proc.free_output(expanded_run)
+        val got_a = fs.join(expanded, "a.txt")
+        val got_b = fs.join(expanded, "b.txt")
+        val (bytes_a, ok_a) = fs.read_all(got_a)
+        val (bytes_b, ok_b) = fs.read_all(got_b)
+        t.expect(ok_a)
+        t.expect(ok_b)
+        t.expect(same_bytes(bytes_a, text_bytes("alpha")))
+        t.expect(same_bytes(bytes_b, text_bytes("beta")))
+        free_bytes(bytes_a)
+        free_bytes(bytes_b)
+        val tar = "C:\\Windows\\System32\\tar.exe"
+        val listed = proc.run([]str(tar, "-tf", two))
+        cmd_ok(listed, "tar -tf")
+        val listing = as_text(listed.stdout)
+        t.expect(contains_text(listing, "a.txt"))
+        t.expect(contains_text(listing, "b.txt"))
+        proc.free_output(listed)
+        val ps_zip = fs.join(test_dir, "ps.zip")
+        var ps_cmd = strbuilder.empty()
+        ps_cmd.append("Compress-Archive -Force -CompressionLevel NoCompression -DestinationPath '")
+        ps_cmd.append(ps_zip)
+        ps_cmd.append("' -Path '")
+        ps_cmd.append(a_txt)
+        ps_cmd.append("','")
+        ps_cmd.append(b_txt)
+        ps_cmd.append("'")
+        val ps_text = copy_text(ps_cmd.str())
+        ps_cmd.free()
+        val compressed = proc.run([]str(pwsh, "-NoProfile", "-Command", ps_text))
+        cmd_ok(compressed, "Compress-Archive")
+        proc.free_output(compressed)
+        val (ps_bytes, ps_ok) = fs.read_all(ps_zip)
+        t.expect(ps_ok)
+        val (ps_entries, ps_msg, ps_read) = read(ps_bytes)
+        if !ps_read {
+            io.eprint(ps_msg)
+            io.eprint("\n")
+            t.fail("Compress-Archive was rejected\n")
+        } else {
+            t.expect(ps_entries.len == 2)
+            var i: usize = 0
+            var saw_a = false
+            var saw_b = false
+            for i < ps_entries.len {
+                val ent = ps_entries.get(i)
+                if same_text(ent.name, "a.txt") && same_bytes(ent.data, text_bytes("alpha")) {
+                    saw_a = true
+                }
+                if same_text(ent.name, "b.txt") && same_bytes(ent.data, text_bytes("beta")) {
+                    saw_b = true
+                }
+                i = i + 1
+            }
+            if !saw_a || !saw_b {
+                io.eprint("archive names:\n")
+                i = 0
+                for i < ps_entries.len {
+                    io.eprint(ps_entries.get(i).name)
+                    io.eprint("\n")
+                    i = i + 1
+                }
+                t.fail("Compress-Archive entries\n")
+            }
+        }
+        release(ps_entries)
+        free_text(ps_msg)
+        free_bytes(ps_bytes)
+        val tar_zip = fs.join(test_dir, "tar.zip")
+        val tar_run = proc.run([]str(tar, "-a", "-cf", tar_zip, "-C", in_dir, "--options", "zip:compression=store", "a.txt", "b.txt"))
+        cmd_ok(tar_run, "tar store")
+        proc.free_output(tar_run)
+        val (tar_bytes, tar_ok) = fs.read_all(tar_zip)
+        t.expect(tar_ok)
+        val (tar_entries, tar_msg, tar_read) = read(tar_bytes)
+        release(tar_entries)
+        if tar_read {
+            t.fail("tar data-descriptor zip was accepted\n")
+        } else if !contains_text(tar_msg, "data descriptor") && !contains_text(tar_msg, "extra field") {
+            io.eprint(tar_msg)
+            io.eprint("\n")
+            t.fail("tar zip rejected for the wrong reason\n")
+        }
+        free_text(tar_msg)
+        free_bytes(tar_bytes)
+        free_text(expand_text)
+        free_text(ps_text)
+        fs.free_str(out_dir)
+        fs.free_str(test_dir)
+        fs.free_str(in_dir)
+        fs.free_str(a_txt)
+        fs.free_str(b_txt)
+        fs.free_str(two)
+        fs.free_str(expanded)
+        fs.free_str(got_a)
+        fs.free_str(got_b)
+        fs.free_str(ps_zip)
+        fs.free_str(tar_zip)
+        free_bytes(arc)
+        xs.free()
+    }
+}

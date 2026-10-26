@@ -1,0 +1,309 @@
+import std.arena
+import std.fs
+import std.list
+import std.mem
+import std.os
+import std.strbuilder
+import std.testing
+
+import src.text
+
+fn parent_of(path: str): str with (a: mem.Allocator) {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            return text.copy_str(text.view_range(path, 0, i))
+        }
+    }
+    return ""
+}
+
+fn repo_root(): str with (a: mem.Allocator) {
+    val exe = os.argv(0)
+    val out_dir = parent_of(exe)
+    val root = parent_of(out_dir)
+    text.free_str(out_dir)
+    return root
+}
+
+fn first_line(src: str): str {
+    var i: usize = 0
+    for i < src.len {
+        val c = src.ptr[i]
+        if c == '\n' as u8 || c == '\r' as u8 {
+            return text.view_range(src, 0, i)
+        }
+        i = i + 1
+    }
+    return src
+}
+
+fn digit(c: u8): bool {
+    return c >= '0' as u8 && c <= '9' as u8
+}
+
+fn read_int(text: str, start: usize): (i64, usize, bool) {
+    var i = start
+    var n: i64 = 0
+    var any = false
+    for i < text.len {
+        if !digit(text.ptr[i]) {
+            break
+        }
+        any = true
+        n = n * 10 + ((text.ptr[i] as i64) - ('0' as i64))
+        i = i + 1
+    }
+    return n, i, any
+}
+
+fn parse_expect(line: str): (i64, i64, str, bool) {
+    if !text.starts_with(line, "jog.mod:") {
+        return 0, 0, "", false
+    }
+    var (line_no, at, lok) = read_int(line, 8)
+    if !lok || at >= line.len || line.ptr[at] != ':' as u8 {
+        return 0, 0, "", false
+    }
+    at = at + 1
+    var (col, at2, cok) = read_int(line, at)
+    at = at2
+    if !cok {
+        return 0, 0, "", false
+    }
+    val rest = text.view_range(line, at, line.len)
+    if !text.starts_with(rest, ": error: ") {
+        return 0, 0, "", false
+    }
+    return line_no, col, text.view_range(rest, 9, rest.len), true
+}
+
+fn version_eq(a: Version, b: Version): bool {
+    if a.major != b.major || a.minor != b.minor || a.patch != b.patch {
+        return false
+    }
+    return a.pre == b.pre
+}
+
+fn same(a: Manifest, b: Manifest): bool {
+    if a.module != b.module || a.has_version != b.has_version || a.has_kind != b.has_kind {
+        return false
+    }
+    if a.library != b.library || a.has_jog != b.has_jog {
+        return false
+    }
+    if !version_eq(a.version, b.version) || !version_eq(a.jog, b.jog) {
+        return false
+    }
+    if a.requires.len != b.requires.len || a.exports.len != b.exports.len || a.links.len != b.links.len {
+        return false
+    }
+    var i: usize = 0
+    for i < a.requires.len {
+        val x = a.requires.get(i)
+        val y = b.requires.get(i)
+        if x.module != y.module || x.spec != y.spec || x.is_path != y.is_path {
+            return false
+        }
+        if !x.is_path && !version_eq(x.version, y.version) {
+            return false
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < a.exports.len {
+        if a.exports.get(i) != b.exports.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < a.links.len {
+        val x = a.links.get(i)
+        val y = b.links.get(i)
+        if x.lib != y.lib || x.target != y.target {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn spot(m: Manifest, name: str) with (t: testing.Testing) {
+    if name == "game.mod" {
+        t.expect(m.requires.len == 3)
+        t.expect(m.requires.get(1).is_path)
+        t.expect(!m.requires.get(2).is_path)
+        t.expect(m.requires.get(2).version.major == "1")
+        t.expect(m.requires.get(2).version.minor == "4")
+        t.expect(m.requires.get(2).version.patch == "0")
+        t.expect(m.requires.get(2).version.pre.len == 0)
+    }
+    if name == "sdl.mod" {
+        t.expect(m.library)
+        t.expect(m.has_kind)
+        t.expect(m.exports.len == 2)
+        t.expect(m.exports.get(0) == "video")
+        t.expect(m.exports.get(1) == "events")
+        t.expect(m.links.len == 3)
+        t.expect(m.links.get(0).target == "windows")
+        t.expect(m.links.get(1).target == "linux")
+        t.expect(m.links.get(2).target == "macos")
+    }
+}
+
+fn check_valid(dir: str) with (t: testing.Testing, a: mem.Allocator) {
+    var (names, ok) = fs.list(dir)
+    if !ok {
+        t.fail(dir)
+        t.fail("\n")
+        return
+    }
+    var i: usize = 0
+    for i < names.len {
+        val name = names.get(i)
+        if text.ends_with(name, ".mod") {
+            val path = fs.join(dir, name)
+            var (data, rok) = fs.read_all(path)
+            if !rok {
+                t.fail(path)
+                t.fail("\n")
+            } else {
+                val body: str = data
+                var (m1, e1, ok1) = parse(body)
+                if !ok1 {
+                    t.fail(path)
+                    t.fail("\n")
+                    t.fail(e1.message)
+                    t.fail("\n")
+                } else {
+                    spot(m1, name)
+                    val once = format(m1)
+                    var (m2, e2, ok2) = parse(once)
+                    if !ok2 {
+                        t.fail(once)
+                        t.fail("\n")
+                    } else {
+                        t.expect(same(m1, m2))
+                        val twice = format(m2)
+                        if once != twice {
+                            t.fail(once)
+                            t.fail("\n")
+                            t.fail(twice)
+                            t.fail("\n")
+                        }
+                    }
+                }
+            }
+            text.free_str(path)
+        }
+        i = i + 1
+    }
+    fs.free_names(&names)
+}
+
+fn check_invalid(dir: str) with (t: testing.Testing, a: mem.Allocator) {
+    var (names, ok) = fs.list(dir)
+    if !ok {
+        t.fail(dir)
+        t.fail("\n")
+        return
+    }
+    var i: usize = 0
+    for i < names.len {
+        val name = names.get(i)
+        val folder = fs.join(dir, name)
+        val mod_path = fs.join(folder, "jog.mod")
+        val exp_path = fs.join(folder, "expect.txt")
+        var (mod_data, mok) = fs.read_all(mod_path)
+        var (exp_data, eok) = fs.read_all(exp_path)
+        if !mok || !eok {
+            t.fail(folder)
+            t.fail("\n")
+        } else {
+            val body: str = mod_data
+            val expect_text: str = exp_data
+            var (line_no, col, message, pok) = parse_expect(first_line(expect_text))
+            if !pok {
+                t.fail(exp_path)
+                t.fail("\n")
+            } else {
+                var (m, err, parsed) = parse(body)
+                if parsed {
+                    t.fail(mod_path)
+                    t.fail(" parsed\n")
+                } else if err.pos.line != line_no || err.pos.col != col || err.message != message {
+                    var b = strbuilder.empty()
+                    b.append(name)
+                    b.append(" got ")
+                    b.append_int(err.pos.line, 10)
+                    b.append(":")
+                    b.append_int(err.pos.col, 10)
+                    b.append(" ")
+                    b.append(err.message)
+                    b.append("\nwant ")
+                    b.append_int(line_no, 10)
+                    b.append(":")
+                    b.append_int(col, 10)
+                    b.append(" ")
+                    b.append(message)
+                    b.append("\n")
+                    t.fail(b.str())
+                    b.free()
+                }
+            }
+        }
+        text.free_str(mod_path)
+        text.free_str(exp_path)
+        text.free_str(folder)
+        i = i + 1
+    }
+    fs.free_names(&names)
+}
+
+fn before(left: str, right: str) with (t: testing.Testing) {
+    var (x, xok) = parse_version(left)
+    var (y, yok) = parse_version(right)
+    t.expect(xok)
+    t.expect(yok)
+    t.expect(compare_versions(x, y) < 0)
+}
+
+@test
+fn valid_manifests_round_trip() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val root = repo_root()
+        val dir = fs.join(root, "testdata/manifest/valid")
+        check_valid(dir)
+    }
+    ar.release()
+}
+
+@test
+fn invalid_manifests_match_jog() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val root = repo_root()
+        val dir = fs.join(root, "testdata/manifest/invalid")
+        check_invalid(dir)
+    }
+    ar.release()
+}
+
+@test
+fn semver_precedence() with (t: testing.Testing) {
+    before("1.0.0-alpha", "1.0.0-alpha.1")
+    before("1.0.0-alpha.1", "1.0.0-alpha.beta")
+    before("1.0.0-alpha.beta", "1.0.0-beta")
+    before("1.0.0-beta", "1.0.0-beta.2")
+    before("1.0.0-beta.2", "1.0.0-beta.11")
+    before("1.0.0-beta.11", "1.0.0-rc.1")
+    before("1.0.0-rc.1", "1.0.0")
+    var (huge, ok) = parse_version("99999999999999999999.0.0")
+    t.expect(ok)
+    t.expect(huge.major.len == 20)
+    t.expect(huge.major == "99999999999999999999")
+}

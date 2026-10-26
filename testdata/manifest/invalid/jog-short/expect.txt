@@ -1,0 +1,1 @@
+jog.mod:2:5: error: jog.mod: '0.1' is not a version; expected MAJOR.MINOR.PATCH

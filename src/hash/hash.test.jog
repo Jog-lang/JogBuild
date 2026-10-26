@@ -1,0 +1,324 @@
+// Package src.hash. SHA-256 vectors from notes/Plan.md milestone 7, and
+// the content hash of testdata/modules/lib without lib.test.jog.
+
+import std.fs
+import std.io
+import std.list
+import std.mem
+import std.os
+import std.strbuilder
+import std.testing
+
+private fn text_bytes(text: str): bytes {
+    var data = bytes()
+    data.ptr = text.ptr as *u8
+    data.len = text.len
+    return data
+}
+
+private fn free_bytes(data: bytes) with (a: mem.Allocator) {
+    a.free(data)
+}
+
+private fn repeat_a(n: usize): bytes with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(n, align(u8))
+    if err != null {
+        panic("out of memory")
+    }
+    var i: usize = 0
+    for i < n {
+        raw.ptr[i] = 'a' as u8
+        i = i + 1
+    }
+    return raw
+}
+
+private fn digest_of(data: bytes): [32]u8 {
+    var s = sha256_new()
+    s.update(data)
+    return s.finish()
+}
+
+private fn digest_chunks(data: bytes, chunk: usize): [32]u8 {
+    var s = sha256_new()
+    var off: usize = 0
+    for off < data.len {
+        var n = chunk
+        if data.len - off < n {
+            n = data.len - off
+        }
+        var part = bytes()
+        part.ptr = data.ptr + off
+        part.len = n
+        s.update(part)
+        off = off + n
+    }
+    return s.finish()
+}
+
+private fn same_dig(left: [32]u8, right: [32]u8): bool {
+    var i: usize = 0
+    for i < 32 {
+        if left[i] != right[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn expect_hex(label: str, data: bytes, want: str) with (t: testing.Testing, a: mem.Allocator) {
+    val got = sha256_hex(data)
+    if got != want {
+        io.eprint(label)
+        io.eprint("\n")
+        io.eprint(got)
+        io.eprint("\n")
+        t.fail("sha256 mismatch\n")
+    }
+    free_text(got)
+    val whole = digest_of(data)
+    t.expect(same_dig(whole, digest_chunks(data, 1)))
+    t.expect(same_dig(whole, digest_chunks(data, 63)))
+    t.expect(same_dig(whole, digest_chunks(data, 65)))
+}
+
+@test
+fn shaVectors() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var empty = bytes()
+        expect_hex("empty", empty, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        expect_hex("abc", text_bytes("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        expect_hex("448", text_bytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+        expect_hex("112", text_bytes("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"), "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1")
+        val a55 = repeat_a(55)
+        expect_hex("55a", a55, "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318")
+        free_bytes(a55)
+        val a56 = repeat_a(56)
+        expect_hex("56a", a56, "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a")
+        free_bytes(a56)
+        val a64 = repeat_a(64)
+        expect_hex("64a", a64, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb")
+        free_bytes(a64)
+        val million = repeat_a(1000000)
+        expect_hex("1e6", million, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0")
+        free_bytes(million)
+        val mib = repeat_a(1048576)
+        expect_hex("1mib", mib, "9bc1b2a288b26af7257a36277ae3816a7d4f16e89c1e7e77d0a5c48bad62b360")
+        free_bytes(mib)
+    }
+}
+
+private fn parent_dir(path: str): str {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val b = path.ptr[i]
+        if b == '/' as u8 || b == '\\' as u8 {
+            var out = bytes()
+            out.ptr = path.ptr as *u8
+            out.len = i
+            return out
+        }
+    }
+    return ""
+}
+
+private fn repo_root(): str {
+    val exe = os.argv(0)
+    return parent_dir(parent_dir(exe))
+}
+
+private fn name_less(left: str, right: str): bool {
+    var n = left.len
+    if right.len < n {
+        n = right.len
+    }
+    var i: usize = 0
+    for i < n {
+        val lb = left.ptr[i]
+        val rb = right.ptr[i]
+        if lb < rb {
+            return true
+        }
+        if rb < lb {
+            return false
+        }
+        i = i + 1
+    }
+    return left.len < right.len
+}
+
+private fn sort_files(files: *list.List<File>) {
+    var i: usize = 1
+    for i < files.len {
+        val key = files.get(i)
+        var j = i
+        for j > 0 {
+            if !name_less(key.name, files.get(j - 1).name) {
+                break
+            }
+            files.set(j, files.get(j - 1))
+            j = j - 1
+        }
+        files.set(j, key)
+        i = i + 1
+    }
+}
+
+private fn rel_join(prefix: str, name: str): str with (a: mem.Allocator) {
+    if prefix.len == 0 {
+        return copy_text(name)
+    }
+    var sb = strbuilder.empty()
+    sb.append(prefix)
+    sb.append("/")
+    sb.append(name)
+    val text = copy_text(sb.str())
+    sb.free()
+    return text
+}
+
+private fn is_lib_test(rel: str): bool {
+    val skip = "lib.test.jog"
+    if rel.len != skip.len {
+        return false
+    }
+    var i: usize = 0
+    for i < rel.len {
+        if rel.ptr[i] != skip.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn collect(dir: str, prefix: str, files: *list.List<File>) with (t: testing.Testing, a: mem.Allocator) {
+    val (names, ok) = fs.list(dir)
+    if !ok {
+        io.eprint("cannot list ")
+        io.eprint(dir)
+        io.eprint("\n")
+        t.fatal("list failed")
+        return
+    }
+    var i: usize = 0
+    for i < names.len {
+        val name = names.get(i)
+        val child = fs.join(dir, name)
+        val rel = rel_join(prefix, name)
+        val (sub, sub_ok) = fs.list(child)
+        if sub_ok {
+            collect(child, rel, files)
+            var sub_owned = sub
+            fs.free_names(&sub_owned)
+            free_text(rel)
+        } else if is_lib_test(rel) {
+            free_text(rel)
+        } else {
+            val (data, read_ok) = fs.read_all(child)
+            if !read_ok {
+                io.eprint("cannot read ")
+                io.eprint(child)
+                io.eprint("\n")
+                t.fatal("read failed")
+                return
+            }
+            var f = File()
+            f.name = rel
+            f.data = data
+            files.push(f)
+        }
+        fs.free_str(child)
+        i = i + 1
+    }
+    var names_owned = names
+    fs.free_names(&names_owned)
+}
+
+private fn build_lines(files: []File): str with (a: mem.Allocator) {
+    var sb = strbuilder.empty()
+    var i: usize = 0
+    for i < files.len {
+        val hex = sha256_hex(files[i].data)
+        sb.append(hex)
+        free_text(hex)
+        sb.append(" ")
+        sb.append(files[i].name)
+        sb.append("\n")
+        i = i + 1
+    }
+    val text = copy_text(sb.str())
+    sb.free()
+    return text
+}
+
+private fn trim_nl(text: str): str {
+    if text.len == 0 {
+        return text
+    }
+    if text.ptr[text.len - 1] != '\n' as u8 {
+        return text
+    }
+    var out = bytes()
+    out.ptr = text.ptr as *u8
+    out.len = text.len - 1
+    return out
+}
+
+private fn free_files(files: *list.List<File>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < files.len {
+        val f = files.get(i)
+        free_text(f.name)
+        a.free(f.data)
+        i = i + 1
+    }
+    files.free()
+}
+
+private fn expect_text(label: str, got: str, want: str) with (t: testing.Testing) {
+    if got == want {
+        return
+    }
+    io.eprint(label)
+    io.eprint("\ngot:\n")
+    io.eprint(got)
+    io.eprint("\nwant:\n")
+    io.eprint(want)
+    io.eprint("\n")
+    t.fail("text mismatch\n")
+}
+
+@test
+fn contentHashLib() with (t: testing.Testing) {
+    with (mem.heap()) {
+        val root = repo_root()
+        val lib = fs.join(root, "testdata/modules/lib")
+        var files: list.List<File>
+        collect(lib, "", &files)
+        sort_files(&files)
+        t.expect(files.len == 6)
+        val lines = build_lines(files.slice_view())
+        val got_hash = content_hash(files.slice_view())
+        val lines_path = fs.join(root, "testdata/hash/lib.lines")
+        val hash_path = fs.join(root, "testdata/hash/lib.hash")
+        val (want_lines_bytes, lines_ok) = fs.read_all(lines_path)
+        val (want_hash_bytes, hash_ok) = fs.read_all(hash_path)
+        t.expect(lines_ok)
+        t.expect(hash_ok)
+        val want_lines: str = want_lines_bytes
+        val want_hash = trim_nl(want_hash_bytes)
+        expect_text("lines", lines, want_lines)
+        expect_text("hash", got_hash, want_hash)
+        free_bytes(want_lines_bytes)
+        free_bytes(want_hash_bytes)
+        free_text(lines)
+        free_text(got_hash)
+        fs.free_str(lib)
+        fs.free_str(lines_path)
+        fs.free_str(hash_path)
+        free_files(&files)
+    }
+}
