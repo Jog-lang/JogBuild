@@ -1,0 +1,1 @@
+jog.mod:2:17: error: jog.mod: target 'windows' is listed twice

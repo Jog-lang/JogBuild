@@ -49,6 +49,8 @@ struct Manifest {
     requires: list.List<Require>
     exports: list.List<str>
     links: list.List<Link>
+    has_targets: bool
+    targets: list.List<str>
 }
 
 struct ParseError {
@@ -66,6 +68,7 @@ private struct Scan {
     saw_version: bool
     saw_kind: bool
     saw_jog: bool
+    saw_targets: bool
     any_export: bool
     export_line: i64
     export_col: i64
@@ -416,6 +419,12 @@ fn free(m: *Manifest) with (a: mem.Allocator) {
         i = i + 1
     }
     m.links.free()
+    i = 0
+    for i < m.targets.len {
+        text.free_str(m.targets.get(i))
+        i = i + 1
+    }
+    m.targets.free()
 }
 
 private fn with_word(before: str, word: str, after: str): str with (a: mem.Allocator) {
@@ -595,6 +604,46 @@ private fn apply_link(m: *Manifest, words: list.List<Word>, line_no: i64, err: *
     return true
 }
 
+private fn known_target(name: str): bool {
+    return name == "windows" || name == "linux" || name == "macos" || name == "wasm"
+}
+
+private fn dup_target(m: *Manifest, name: str): bool {
+    var i: usize = 0
+    for i < m.targets.len {
+        if m.targets.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Names are windows, linux, macos, or wasm. posix is a file suffix, not a target.
+private fn apply_targets(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
+    if st.saw_targets {
+        return fail(err, line_no, words.get(0).col, "jog.mod: duplicate targets declaration")
+    }
+    if words.len < 2 {
+        return fail(err, line_no, words.get(0).col, "jog.mod: missing target name")
+    }
+    var i: usize = 1
+    for i < words.len {
+        val w = words.get(i)
+        if !known_target(w.text) {
+            return fail(err, line_no, w.col, with_word("jog.mod: unknown target '", w.text, "'; expected windows, linux, macos, or wasm"))
+        }
+        if dup_target(m, w.text) {
+            return fail(err, line_no, w.col, with_word("jog.mod: target '", w.text, "' is listed twice"))
+        }
+        m.targets.push(text.copy_str(w.text))
+        i = i + 1
+    }
+    m.has_targets = true
+    st.saw_targets = true
+    return true
+}
+
 private fn apply_version(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
     if st.saw_version {
         return fail(err, line_no, words.get(0).col, "jog.mod: duplicate version declaration")
@@ -734,6 +783,9 @@ private fn apply(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, 
     if is_link_word(first) {
         return apply_link(m, words, line_no, err)
     }
+    if first == "targets" {
+        return apply_targets(m, words, line_no, st, err)
+    }
     if first == "version" {
         return apply_version(m, words, line_no, st, err)
     }
@@ -863,6 +915,16 @@ fn format(m: Manifest): str with (a: mem.Allocator) {
         b.append(link.lib)
         b.append("\n")
         i = i + 1
+    }
+    if m.has_targets {
+        b.append("targets")
+        i = 0
+        for i < m.targets.len {
+            b.append(" ")
+            b.append(m.targets.get(i))
+            i = i + 1
+        }
+        b.append("\n")
     }
     val text = text.copy_str(b.str())
     b.free()

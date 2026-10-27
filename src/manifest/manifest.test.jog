@@ -91,13 +91,16 @@ fn same(a: Manifest, b: Manifest): bool {
     if a.module != b.module || a.has_version != b.has_version || a.has_kind != b.has_kind {
         return false
     }
-    if a.library != b.library || a.has_jog != b.has_jog {
+    if a.library != b.library || a.has_jog != b.has_jog || a.has_targets != b.has_targets {
         return false
     }
     if !version_eq(a.version, b.version) || !version_eq(a.jog, b.jog) {
         return false
     }
     if a.requires.len != b.requires.len || a.exports.len != b.exports.len || a.links.len != b.links.len {
+        return false
+    }
+    if a.targets.len != b.targets.len {
         return false
     }
     var i: usize = 0
@@ -128,11 +131,20 @@ fn same(a: Manifest, b: Manifest): bool {
         }
         i = i + 1
     }
+    i = 0
+    for i < a.targets.len {
+        if a.targets.get(i) != b.targets.get(i) {
+            return false
+        }
+        i = i + 1
+    }
     return true
 }
 
 fn spot(m: Manifest, name: str) with (t: testing.Testing) {
     if name == "game.mod" {
+        t.expect(!m.has_targets)
+        t.expect(m.targets.len == 0)
         t.expect(m.requires.len == 3)
         t.expect(m.requires.get(1).is_path)
         t.expect(!m.requires.get(2).is_path)
@@ -151,6 +163,15 @@ fn spot(m: Manifest, name: str) with (t: testing.Testing) {
         t.expect(m.links.get(0).target == "windows")
         t.expect(m.links.get(1).target == "linux")
         t.expect(m.links.get(2).target == "macos")
+    }
+    if name == "targets.mod" {
+        t.expect(m.has_targets)
+        t.expect(m.library)
+        t.expect(m.targets.len == 4)
+        t.expect(m.targets.get(0) == "windows")
+        t.expect(m.targets.get(1) == "linux")
+        t.expect(m.targets.get(2) == "macos")
+        t.expect(m.targets.get(3) == "wasm")
     }
 }
 
@@ -335,6 +356,7 @@ fn compiler_manifests_parse() with (t: testing.Testing) {
         rels.push("tests/jog/pkg/modules/plain/jog.mod")
         rels.push("tests/jog/pkg/modules/shadow/jog.mod")
         rels.push("tests/jog/pkg/modules/noexport/jog.mod")
+        rels.push("tests/jog/pkg/targets/jog.mod")
         var i: usize = 0
         for i < rels.len {
             val path = fs.join(base, rels.get(i))
