@@ -1,4 +1,4 @@
-# Jog-build
+# JogBuild
 
 A build tool for Jog. It reads a module's `jog.mod`, resolves its dependencies (local folders and `.jogz` archives), unpacks archives into a per-user cache, writes `jog.lock`, packs libraries, and runs the compiler with one `--module <name>=<dir>` flag per dependency. It is written in Jog. The format it follows is `design/Packages.md` in JogDocs.
 
