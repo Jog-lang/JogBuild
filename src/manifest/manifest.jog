@@ -2,12 +2,14 @@
 // The format is notes/Packages.md, "jog.mod v2". Line and column match
 // jog check. Numbers stay digit strings so a version longer than i64
 // still parses. format writes the normal form in notes/Plan.md.
+// parse keeps a ParseError with a line and column. That is more than
+// error? can carry, so the bool is "the manifest parsed".
 
+import std.fs
 import std.list
 import std.mem
 import std.strbuilder
-
-import src.text
+import std.text
 
 struct Version {
     major: str
@@ -74,8 +76,9 @@ private struct Scan {
     export_col: i64
 }
 
+// all_digits names its parameter text, which would hide this package.
 private fn is_digit(c: u8): bool {
-    return c >= '0' as u8 && c <= '9' as u8
+    return text.is_digit(c)
 }
 
 private fn is_letter(c: u8): bool {
@@ -155,14 +158,14 @@ private fn is_dotted_path(word: str): bool {
     var i: usize = 0
     for i < word.len {
         if word.ptr[i] == '.' as u8 {
-            if !is_ident(text.view_range(word, start, i)) {
+            if !is_ident(text.slice(word, start, i)) {
                 return false
             }
             start = i + 1
         }
         i = i + 1
     }
-    return is_ident(text.view_range(word, start, word.len))
+    return is_ident(text.slice(word, start, word.len))
 }
 
 fn parse_version(word: str): (Version, bool) {
@@ -177,7 +180,7 @@ fn parse_version(word: str): (Version, bool) {
             }
             i = i + 1
         }
-        val ident = text.view_range(word, start, i)
+        val ident = text.slice(word, start, i)
         if !numeric_ident(ident) {
             return v, false
         }
@@ -216,12 +219,12 @@ fn parse_version(word: str): (Version, bool) {
             }
             i = i + 1
         }
-        val id = text.view_range(word, start, i)
+        val id = text.slice(word, start, i)
         if id.len == 0 || (all_digits(id) && !numeric_ident(id)) {
             return v, false
         }
         if i == word.len {
-            v.pre = text.view_range(word, pre_start, word.len)
+            v.pre = text.slice(word, pre_start, word.len)
             return v, true
         }
         i = i + 1
@@ -289,8 +292,8 @@ private fn cmp_pre(a: str, b: str): i32 {
             }
             bi = bi + 1
         }
-        val a_id = text.view_range(a, a_start, ai)
-        val b_id = text.view_range(b, b_start, bi)
+        val a_id = text.slice(a, a_start, ai)
+        val b_id = text.slice(b, b_start, bi)
         val a_num = all_digits(a_id)
         val b_num = all_digits(b_id)
         var c: i32 = 0
@@ -346,18 +349,18 @@ fn accepts(need: Version, have: Version): bool {
 
 fn copy_version(v: Version): Version with (a: mem.Allocator) {
     var o: Version
-    o.major = text.copy_str(v.major)
-    o.minor = text.copy_str(v.minor)
-    o.patch = text.copy_str(v.patch)
-    o.pre = text.copy_str(v.pre)
+    o.major = fs.copy_str(v.major)
+    o.minor = fs.copy_str(v.minor)
+    o.patch = fs.copy_str(v.patch)
+    o.pre = fs.copy_str(v.pre)
     return o
 }
 
 private fn zero_version(): Version with (a: mem.Allocator) {
     var v: Version
-    v.major = text.copy_str("0")
-    v.minor = text.copy_str("0")
-    v.patch = text.copy_str("0")
+    v.major = fs.copy_str("0")
+    v.minor = fs.copy_str("0")
+    v.patch = fs.copy_str("0")
     return v
 }
 
@@ -380,48 +383,48 @@ fn version_text(v: Version): str with (a: mem.Allocator) {
     } else {
         append_version(&b, v)
     }
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }
 
 private fn free_version(v: *Version) with (a: mem.Allocator) {
-    text.free_str(v.major)
-    text.free_str(v.minor)
-    text.free_str(v.patch)
-    text.free_str(v.pre)
+    fs.free_str(v.major)
+    fs.free_str(v.minor)
+    fs.free_str(v.patch)
+    fs.free_str(v.pre)
 }
 
 fn free(m: *Manifest) with (a: mem.Allocator) {
-    text.free_str(m.module)
+    fs.free_str(m.module)
     free_version(&m.version)
     free_version(&m.jog)
     var i: usize = 0
     for i < m.requires.len {
         var r = m.requires.get(i)
-        text.free_str(r.module)
-        text.free_str(r.spec)
+        fs.free_str(r.module)
+        fs.free_str(r.spec)
         free_version(&r.version)
         i = i + 1
     }
     m.requires.free()
     i = 0
     for i < m.exports.len {
-        text.free_str(m.exports.get(i))
+        fs.free_str(m.exports.get(i))
         i = i + 1
     }
     m.exports.free()
     i = 0
     for i < m.links.len {
         var link = m.links.get(i)
-        text.free_str(link.lib)
-        text.free_str(link.target)
+        fs.free_str(link.lib)
+        fs.free_str(link.target)
         i = i + 1
     }
     m.links.free()
     i = 0
     for i < m.targets.len {
-        text.free_str(m.targets.get(i))
+        fs.free_str(m.targets.get(i))
         i = i + 1
     }
     m.targets.free()
@@ -432,7 +435,7 @@ private fn with_word(before: str, word: str, after: str): str with (a: mem.Alloc
     b.append(before)
     b.append(word)
     b.append(after)
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }
@@ -458,7 +461,7 @@ private fn tokenize(line: str): list.List<Word> with (a: mem.Allocator) {
             i = i + 1
         }
         var w: Word
-        w.text = text.view_range(line, start, i)
+        w.text = text.slice(line, start, i)
         w.col = (start as i64) + 1
         words.push(w)
     }
@@ -507,7 +510,7 @@ private fn base_before_dot(word: str): str {
     var i: usize = 0
     for i < word.len {
         if word.ptr[i] == '.' as u8 {
-            return text.view_range(word, 0, i)
+            return text.slice(word, 0, i)
         }
         i = i + 1
     }
@@ -515,7 +518,11 @@ private fn base_before_dot(word: str): str {
 }
 
 private fn has_dot(word: str): bool {
-    return text.index_of(word, '.' as u8) >= 0
+    val (at, found) = text.index_of(word, ".")
+    if !found {
+        return false
+    }
+    return at < word.len
 }
 
 private fn is_reserved(word: str): bool {
@@ -577,7 +584,7 @@ private fn apply_module(m: *Manifest, words: list.List<Word>, line_no: i64, st: 
     if name == "std" {
         return fail(err, line_no, ncol, "jog.mod: module name 'std' is reserved for the standard library")
     }
-    m.module = text.copy_str(name)
+    m.module = fs.copy_str(name)
     m.name_line = line_no
     m.name_col = ncol
     st.saw_module = true
@@ -589,7 +596,7 @@ private fn apply_link(m: *Manifest, words: list.List<Word>, line_no: i64, err: *
     var target: str = ""
     if first.text != "link" {
         val tcol = first.col + 5
-        target = text.view_range(first.text, 5, first.text.len)
+        target = text.slice(first.text, 5, first.text.len)
         if target != "windows" && target != "linux" && target != "macos" {
             return fail(err, line_no, tcol, with_word("jog.mod: unknown target '", target, "'; expected windows, linux, or macos"))
         }
@@ -598,8 +605,8 @@ private fn apply_link(m: *Manifest, words: list.List<Word>, line_no: i64, err: *
         return false
     }
     var link: Link
-    link.lib = text.copy_str(words.get(1).text)
-    link.target = text.copy_str(target)
+    link.lib = fs.copy_str(words.get(1).text)
+    link.target = fs.copy_str(target)
     m.links.push(link)
     return true
 }
@@ -636,7 +643,7 @@ private fn apply_targets(m: *Manifest, words: list.List<Word>, line_no: i64, st:
         if dup_target(m, w.text) {
             return fail(err, line_no, w.col, with_word("jog.mod: target '", w.text, "' is listed twice"))
         }
-        m.targets.push(text.copy_str(w.text))
+        m.targets.push(fs.copy_str(w.text))
         i = i + 1
     }
     m.has_targets = true
@@ -734,8 +741,8 @@ private fn apply_require(m: *Manifest, words: list.List<Word>, line_no: i64, err
         ver = copy_version(parsed)
     }
     var req: Require
-    req.module = text.copy_str(name.text)
-    req.spec = text.copy_str(spec.text)
+    req.module = fs.copy_str(name.text)
+    req.spec = fs.copy_str(spec.text)
     req.is_path = path
     req.version = ver
     req.pos.line = line_no
@@ -755,7 +762,7 @@ private fn apply_export(m: *Manifest, words: list.List<Word>, line_no: i64, st: 
     if dup_export(m, path.text) {
         return fail(err, line_no, path.col, with_word("jog.mod: package '", path.text, "' is exported twice"))
     }
-    m.exports.push(text.copy_str(path.text))
+    m.exports.push(fs.copy_str(path.text))
     if !st.any_export {
         st.any_export = true
         st.export_line = line_no
@@ -818,7 +825,7 @@ fn parse(src: str): (Manifest, ParseError, bool) with (a: mem.Allocator) {
         for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
             at = at + 1
         }
-        val line = text.view_range(src, line_start, at)
+        val line = text.slice(src, line_start, at)
         if at < src.len && src.ptr[at] == '\r' as u8 {
             at = at + 1
         }
@@ -926,7 +933,7 @@ fn format(m: Manifest): str with (a: mem.Allocator) {
         }
         b.append("\n")
     }
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }

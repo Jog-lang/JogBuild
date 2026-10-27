@@ -1,3 +1,4 @@
+import std.fs
 import std.arena
 import std.list
 import std.mem
@@ -5,7 +6,7 @@ import std.os
 import std.strbuilder
 import std.testing
 
-import src.text
+import std.text
 
 fn parent_of(path: str): str with (a: mem.Allocator) {
     var i = path.len
@@ -13,7 +14,7 @@ fn parent_of(path: str): str with (a: mem.Allocator) {
         i = i - 1
         val c = path.ptr[i]
         if c == '/' as u8 || c == '\\' as u8 {
-            return text.copy_str(text.view_range(path, 0, i))
+            return fs.copy_str(text.slice(path, 0, i))
         }
     }
     return ""
@@ -23,7 +24,7 @@ fn repo_root(): str with (a: mem.Allocator) {
     val exe = os.argv(0)
     val out_dir = parent_of(exe)
     val root = parent_of(out_dir)
-    text.free_str(out_dir)
+    fs.free_str(out_dir)
     return root
 }
 
@@ -37,7 +38,7 @@ fn join_args(args: list.List<str>): str with (a: mem.Allocator) {
         b.append(args.get(i))
         i = i + 1
     }
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }

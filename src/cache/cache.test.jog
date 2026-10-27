@@ -12,7 +12,8 @@ import std.strbuilder
 import std.testing
 
 import src.hash
-import src.text
+import src.host
+import std.text
 import src.zip
 
 private fn test_parent(path: str): str with (a: mem.Allocator) {
@@ -21,7 +22,7 @@ private fn test_parent(path: str): str with (a: mem.Allocator) {
         i = i - 1
         val c = path.ptr[i]
         if c == '/' as u8 || c == '\\' as u8 {
-            return text.copy_str(text.view_range(path, 0, i))
+            return fs.copy_str(text.slice(path, 0, i))
         }
     }
     return ""
@@ -31,30 +32,23 @@ private fn repo_root(): str with (a: mem.Allocator) {
     val exe = os.argv(0)
     val out_dir = test_parent(exe)
     val root = test_parent(out_dir)
-    text.free_str(out_dir)
+    fs.free_str(out_dir)
     return root
 }
 
 private fn test_mkdir(path: str) {
-    if path.len == 0 || path.len >= 4096 {
-        return
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    c.CreateDirectoryW(wide[..].ptr, 0)
+    host.mkdir(path)
 }
 
 private fn test_rel(prefix: str, name: str): str with (a: mem.Allocator) {
     if prefix.len == 0 {
-        return text.copy_str(name)
+        return fs.copy_str(name)
     }
     var b = strbuilder.empty()
     b.append(prefix)
     b.append("/")
     b.append(name)
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
@@ -134,11 +128,11 @@ private fn collect(dir: str, prefix: str, files: *list.List<hash.File>): bool wi
                 if !collect(child, rel, files) {
                     failed = true
                 }
-                text.free_str(rel)
+                fs.free_str(rel)
             }
         } else {
-            var (data, rok) = fs.read_all(child)
-            if !rok {
+            var (data, err) = fs.read_all(child)
+            if err != null {
                 failed = true
             } else {
                 var f: hash.File
@@ -159,7 +153,7 @@ private fn manifest_text(sum: str): str with (a: mem.Allocator) {
     b.append("archive 1\nmodule lib\nversion 0.2.0\nkind library\njog 0.0.1\nexport shapes\nhash ")
     b.append(sum)
     b.append("\n")
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
@@ -197,7 +191,7 @@ private fn zip_lib(files: list.List<hash.File>, sum: str): bytes with (a: mem.Al
         var b = strbuilder.empty()
         b.append("src/")
         b.append(files.get(i).name)
-        val ename = text.copy_str(b.str())
+        val ename = fs.copy_str(b.str())
         b.free()
         names.push(ename)
         var e: zip.Entry
@@ -210,11 +204,11 @@ private fn zip_lib(files: list.List<hash.File>, sum: str): bytes with (a: mem.Al
     ents.free()
     var k: usize = 0
     for k < names.len {
-        text.free_str(names.get(k))
+        fs.free_str(names.get(k))
         k = k + 1
     }
     names.free()
-    text.free_str(man)
+    fs.free_str(man)
     return arc
 }
 
@@ -222,7 +216,7 @@ private fn trim_nl(s: str): str {
     if s.len == 0 || s.ptr[s.len - 1] != '\n' as u8 {
         return s
     }
-    return text.view_range(s, 0, s.len - 1)
+    return text.slice(s, 0, s.len - 1)
 }
 
 private fn load_lib(): (list.List<hash.File>, str, bool) with (a: mem.Allocator) {
@@ -231,7 +225,7 @@ private fn load_lib(): (list.List<hash.File>, str, bool) with (a: mem.Allocator)
     val lib = fs.join(root, "testdata/modules/lib")
     val ok = collect(lib, "", &files)
     fs.free_str(lib)
-    text.free_str(root)
+    fs.free_str(root)
     if !ok {
         return files, "", false
     }
@@ -248,14 +242,14 @@ private fn write_zip(path: str, arc: bytes) {
         i = i - 1
         val c = slash.ptr[i]
         if c == '/' as u8 || c == '\\' as u8 {
-            parent = text.view_range(slash, 0, i)
+            parent = text.slice(slash, 0, i)
             break
         }
     }
     if parent.len > 0 {
         test_mkdir(parent)
     }
-    if !fs.write_all(path, arc) {
+    if fs.write_all(path, arc) != null {
         io.eprint("cannot write ")
         io.eprintln(path)
     }
@@ -270,8 +264,8 @@ fn install_lib_archive() with (t: testing.Testing) {
         t.expect(files.len == 6)
         val root = repo_root()
         val hash_path = fs.join(root, "testdata/hash/lib.hash")
-        var (want_bytes, hok) = fs.read_all(hash_path)
-        t.expect(hok)
+        var (want_bytes, err) = fs.read_all(hash_path)
+        t.expect(err == null)
         val want = trim_nl(want_bytes)
         t.expectEq(sum, want)
         val cache = fs.join(root, "out/test-cache/lib")
@@ -280,20 +274,20 @@ fn install_lib_archive() with (t: testing.Testing) {
         val arc = zip_lib(files, sum)
         write_zip(jogz, arc)
         var (am, iok) = install(cache, jogz)
-        t.expect(iok)
-        if iok {
+        t.expect(iok == null)
+        if iok == null {
             t.expectEq(am.hash, sum)
             t.expect(am.m.module == "lib")
         }
         var (am2, iok2) = install(cache, jogz)
-        t.expect(iok2)
-        if iok2 {
+        t.expect(iok2 == null)
+        if iok2 == null {
             t.expectEq(am2.hash, sum)
         }
         val man = fs.join(cache, "mod/lib/0.2.0/manifest")
         val src = fs.join(cache, "mod/lib/0.2.0/src")
-        var (man_bytes, mok) = fs.read_all(man)
-        t.expect(mok)
+        var (man_bytes, man_err) = fs.read_all(man)
+        t.expect(man_err == null)
         var (listed, lok) = fs.list(src)
         t.expect(lok)
         if lok {
@@ -305,7 +299,7 @@ fn install_lib_archive() with (t: testing.Testing) {
         test_sort(&extracted)
         val got = hash.content_hash(extracted.slice_view())
         t.expectEq(got, want)
-        text.free_str(root)
+        fs.free_str(root)
         fs.free_str(hash_path)
         fs.free_str(cache)
         fs.free_str(jogz)
@@ -330,13 +324,13 @@ fn reject_changed_byte() with (t: testing.Testing) {
         arc.ptr[40] = arc.ptr[40] ^ 0xFF as u8
         write_zip(jogz, arc)
         var (am, iok) = install(cache, jogz)
-        t.expect(!iok)
+        t.expect(iok != null)
         t.expect(am.hash.len == 0)
         val man = fs.join(cache, "mod/lib/0.2.0/manifest")
-        var (data, exists) = fs.read_all(man)
-        t.expect(!exists)
+        var (data, err) = fs.read_all(man)
+        t.expect(err != null)
         t.expect(data.len == 0)
-        text.free_str(root)
+        fs.free_str(root)
         fs.free_str(cache)
         fs.free_str(jogz)
         fs.free_str(man)
@@ -357,8 +351,8 @@ fn reject_different_hash() with (t: testing.Testing) {
         val arc = zip_lib(files, sum)
         write_zip(first, arc)
         var (am, iok) = install(cache, first)
-        t.expect(iok)
-        if iok {
+        t.expect(iok == null)
+        if iok == null {
             t.expect(am.hash.len > 0)
         }
         var changed: list.List<hash.File>
@@ -380,11 +374,11 @@ fn reject_different_hash() with (t: testing.Testing) {
         val arc2 = zip_lib(changed, sum2)
         write_zip(second, arc2)
         var (am2, iok2) = install(cache, second)
-        t.expect(!iok2)
+        t.expect(iok2 != null)
         t.expect(am2.hash.len == 0)
         val banner = fs.join(cache, "mod/lib/0.2.0/src/data/banner.txt")
-        var (kept, kok) = fs.read_all(banner)
-        t.expect(kok)
+        var (kept, err) = fs.read_all(banner)
+        t.expect(err == null)
         var banner_len: usize = 0
         var bi: usize = 0
         for bi < files.len {
@@ -394,7 +388,7 @@ fn reject_different_hash() with (t: testing.Testing) {
             bi = bi + 1
         }
         t.expect(kept.len == banner_len)
-        text.free_str(root)
+        fs.free_str(root)
         fs.free_str(cache)
         fs.free_str(first)
         fs.free_str(second)
@@ -432,7 +426,7 @@ fn reject_bad_names() with (t: testing.Testing) {
             val path = fs.join(base, "bad.jogz")
             write_zip(path, arc)
             var (am, iok) = install(base, path)
-            t.expect(!iok)
+            t.expect(iok != null)
             t.expect(am.hash.len == 0)
             val man = fs.join(base, "mod")
             var (listed, lok) = fs.list(man)
@@ -446,10 +440,10 @@ fn reject_bad_names() with (t: testing.Testing) {
             i = i + 1
         }
         val slipped = fs.join(root, "out/test-cache/x")
-        var (slip, sok) = fs.read_all(slipped)
-        t.expect(!sok)
+        var (slip, err) = fs.read_all(slipped)
+        t.expect(err != null)
         t.expect(slip.len == 0)
-        text.free_str(root)
+        fs.free_str(root)
         fs.free_str(base)
         fs.free_str(slipped)
     }

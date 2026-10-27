@@ -1,0 +1,76 @@
+// POSIX bodies for src.host. Loaded for linux and macos.
+// mkdir goes through jogrt_mkdir because mode_t differs between the two.
+
+import std.c
+import std.fs
+import std.mem
+import std.os
+
+private fn fill(path: str, dest: *u8): bool {
+    if path.len == 0 || path.len >= 4096 {
+        return false
+    }
+    c.memcpy(dest as *void, path.ptr as *const void, path.len)
+    dest[path.len] = 0
+    return true
+}
+
+actual fn path_sep(): u8 {
+    return ':' as u8
+}
+
+actual fn compiler_file(): str {
+    return "jog"
+}
+
+actual fn windows(): bool {
+    return false
+}
+
+actual fn fold_case(): bool {
+    return false
+}
+
+actual fn mkdir(path: str): bool {
+    var buf: [4096]u8
+    if !fill(path, buf[..].ptr) {
+        return false
+    }
+    return c.jogrt_mkdir(buf[..].ptr as *const c.char) == 0
+}
+
+actual fn remove_file(path: str) {
+    var buf: [4096]u8
+    if !fill(path, buf[..].ptr) {
+        return
+    }
+    c.unlink(buf[..].ptr as *const c.char)
+}
+
+actual fn remove_dir(path: str) {
+    var buf: [4096]u8
+    if !fill(path, buf[..].ptr) {
+        return
+    }
+    c.rmdir(buf[..].ptr as *const c.char)
+}
+
+actual fn cache_dir(): str with (a: mem.Allocator) {
+    var (xdg, ok) = os.env("XDG_CACHE_HOME")
+    if ok && xdg.len > 0 {
+        val copy = fs.copy_str(xdg)
+        val root = fs.join(copy, "jog")
+        fs.free_str(copy)
+        return root
+    }
+    var (home, hok) = os.env("HOME")
+    if !hok || home.len == 0 {
+        return ""
+    }
+    val copy = fs.copy_str(home)
+    val cache = fs.join(copy, ".cache")
+    val root = fs.join(cache, "jog")
+    fs.free_str(copy)
+    fs.free_str(cache)
+    return root
+}

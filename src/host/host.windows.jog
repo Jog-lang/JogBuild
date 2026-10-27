@@ -1,0 +1,68 @@
+// Windows bodies for src.host. Paths cross Win32 as UTF-16.
+
+import std.c
+import std.fs
+import std.mem
+import std.os
+
+actual fn path_sep(): u8 {
+    return ';' as u8
+}
+
+actual fn compiler_file(): str {
+    return "jog.exe"
+}
+
+actual fn windows(): bool {
+    return true
+}
+
+actual fn fold_case(): bool {
+    return true
+}
+
+actual fn mkdir(path: str): bool {
+    if path.len == 0 || path.len >= 4096 {
+        return false
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return false
+    }
+    return c.CreateDirectoryW(wide[..].ptr, 0) != 0
+}
+
+actual fn remove_file(path: str) {
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.DeleteFileW(wide[..].ptr)
+}
+
+actual fn remove_dir(path: str) {
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.RemoveDirectoryW(wide[..].ptr)
+}
+
+actual fn cache_dir(): str with (a: mem.Allocator) {
+    var (local, lok) = os.env("LOCALAPPDATA")
+    if !lok || local.len == 0 {
+        return ""
+    }
+    val local_copy = fs.copy_str(local)
+    val jog = fs.join(local_copy, "jog")
+    val root = fs.join(jog, "cache")
+    fs.free_str(local_copy)
+    fs.free_str(jog)
+    return root
+}

@@ -1,0 +1,22 @@
+// Package src.fail. ErrReported is a failure whose explanation was
+// already written to stderr. Callers test it with err != null. They
+// do not print message() again. Nothing is allocated. The tag field
+// is storage so the global has an address. It is not a code.
+
+struct Reported {
+    tag: u8
+}
+
+/**
+ * Fallback text. The real explanation was already printed.
+ * @return the word "failed"
+ */
+fn Reported.message(): str {
+    return "failed"
+}
+
+var reported: Reported
+
+// Identity compare is not required. null is success, and any other
+// error from fs or proc is returned as itself.
+val ErrReported = &reported

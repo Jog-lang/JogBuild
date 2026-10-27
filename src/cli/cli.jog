@@ -9,7 +9,7 @@
 // when there was no "--".
 
 import std.arena
-import std.c
+import std.error as errors
 import std.fs
 import std.io
 import std.list
@@ -22,11 +22,7 @@ import src.lockfile
 import src.manifest
 import src.pack
 import src.resolve
-import src.text
-
-private extern {
-    fn GetCurrentDirectoryA(cap: c.unsigned_long, buffer: *c.char): c.unsigned_long
-}
+import std.text
 
 struct Flags {
     release: bool
@@ -190,7 +186,7 @@ private fn apply_long(command: str, f: *Flags, arg: str, args: []str, i: usize):
         var value: str = ""
         var next = i + 1
         if text.starts_with(arg, "--target=") {
-            value = text.view_range(arg, 9, arg.len)
+            value = text.slice(arg, 9, arg.len)
         } else {
             if i + 1 >= args.len {
                 return false, 0
@@ -238,26 +234,22 @@ private fn write_lock(root: str, g: resolve.Graph): bool with (a: mem.Allocator)
     var ents = lockfile.entries(g)
     val body = lockfile.format(ents.slice_view())
     val path = fs.join(root, "jog.lock")
-    val ok = lockfile.write_if_changed(path, body)
+    val err = lockfile.write_if_changed(path, body)
     lockfile.free_entries(&ents)
-    text.free_str(body)
+    fs.free_str(body)
     fs.free_str(path)
-    if !ok {
+    if err != null {
         io.eprintln("jog-build: cannot write jog.lock")
     }
-    return ok
+    return err == null
 }
 
-private fn cwd_path(): (str, bool) with (a: mem.Allocator) {
-    var buf: [4096]u8
-    val n = GetCurrentDirectoryA(4096, buf[..].ptr as *c.char)
-    if n == 0 || n >= 4096 {
-        return "", false
+private fn cwd_path(): (str, error?) with (a: mem.Allocator) {
+    var (dir, ok) = fs.cwd()
+    if !ok {
+        return "", errors.ErrIO
     }
-    var view = bytes()
-    view.ptr = buf[..].ptr
-    view.len = n as usize
-    return text.copy_str(view as str), true
+    return dir, null
 }
 
 private fn path_name(path: str): str with (a: mem.Allocator) {
@@ -278,9 +270,9 @@ private fn path_name(path: str): str with (a: mem.Allocator) {
         i = i + 1
     }
     if slash < 0 {
-        return text.copy_str(text.view_range(path, 0, end))
+        return fs.copy_str(text.slice(path, 0, end))
     }
-    return text.copy_str(text.view_range(path, (slash as usize) + 1, end))
+    return fs.copy_str(text.slice(path, (slash as usize) + 1, end))
 }
 
 private fn init_in(f: Flags): i32 with (a: mem.Allocator) {
@@ -289,7 +281,7 @@ private fn init_in(f: Flags): i32 with (a: mem.Allocator) {
         name = f.name
     } else {
         var (dir, dok) = cwd_path()
-        if !dok {
+        if dok != null {
             io.eprintln("jog-build init: cannot read the current directory")
             return 1
         }
@@ -301,8 +293,8 @@ private fn init_in(f: Flags): i32 with (a: mem.Allocator) {
         io.eprintln("' is not an identifier; pass a name")
         return 1
     }
-    var (existing, found) = fs.read_all("jog.mod")
-    if found {
+    var (existing, err) = fs.read_all("jog.mod")
+    if err == null {
         if existing.len > 0 {
             a.free(existing)
         }
@@ -310,12 +302,12 @@ private fn init_in(f: Flags): i32 with (a: mem.Allocator) {
         return 1
     }
     var (jog, jok) = compiler.find()
-    if !jok {
-        io.eprintln("jog-build: compiler not found. Set JOG, or put jog.exe on PATH")
+    if jok != null {
+        io.eprintln("jog-build: compiler not found. Set JOG, or put jog on PATH")
         return 1
     }
     var (ver, vok) = compiler.version(jog)
-    if !vok {
+    if vok != null {
         io.eprintln("jog-build: cannot read the compiler version")
         return 1
     }
@@ -333,7 +325,7 @@ private fn init_in(f: Flags): i32 with (a: mem.Allocator) {
     m.has_jog = true
     m.jog = ver
     val body = manifest.format(m)
-    if !fs.write_all("jog.mod", as_bytes(body)) {
+    if fs.write_all("jog.mod", as_bytes(body)) != null {
         io.eprintln("jog-build init: cannot write jog.mod")
         return 1
     }
@@ -343,15 +335,15 @@ private fn init_in(f: Flags): i32 with (a: mem.Allocator) {
         var b = strbuilder.empty()
         b.append(name)
         b.append(".jog")
-        file_name = text.copy_str(b.str())
+        file_name = fs.copy_str(b.str())
         b.free()
         file_body = "fn ready(): bool {\n    return true\n}\n"
     }
-    if !fs.write_all(file_name, as_bytes(file_body)) {
+    if fs.write_all(file_name, as_bytes(file_body)) != null {
         io.eprintln("jog-build init: cannot write the root file")
         return 1
     }
-    if !fs.write_all(".gitignore", as_bytes("out/\n")) {
+    if fs.write_all(".gitignore", as_bytes("out/\n")) != null {
         io.eprintln("jog-build init: cannot write .gitignore")
         return 1
     }
@@ -374,36 +366,42 @@ private struct Loaded {
     graph: resolve.Graph
 }
 
-private fn load(): (Loaded, bool) with (a: mem.Allocator) {
+/**
+ * Find the compiler, the module root, and the resolved graph.
+ * Resolve prints its own diagnostics. The other failures are printed here.
+ * @context a allocator for the paths and the graph
+ * @return the loaded build, or the error from find, module_root, version, or resolve
+ */
+private fn load(): (Loaded, error?) with (a: mem.Allocator) {
     var loaded: Loaded
     var (jog, found) = compiler.find()
-    if !found {
-        io.eprintln("jog-build: compiler not found. Set JOG, or put jog.exe on PATH")
-        return loaded, false
+    if found != null {
+        io.eprintln("jog-build: compiler not found. Set JOG, or put jog on PATH")
+        return loaded, found
     }
     loaded.jog = jog
     var (root, rok) = resolve.module_root()
-    if !rok {
+    if rok != null {
         io.eprintln("jog-build: cannot find jog.mod")
-        return loaded, false
+        return loaded, rok
     }
     loaded.root = root
     var (ver, vok) = compiler.version(jog)
-    if !vok {
+    if vok != null {
         io.eprintln("jog-build: cannot read the compiler version")
-        return loaded, false
+        return loaded, vok
     }
     var (g, gok) = resolve.resolve(root, ver)
-    if !gok {
-        return loaded, false
+    if gok != null {
+        return loaded, gok
     }
     loaded.graph = g
-    return loaded, true
+    return loaded, null
 }
 
 private fn build_in(f: Flags): i32 with (a: mem.Allocator) {
     var (loaded, ok) = load()
-    if !ok {
+    if ok != null {
         return 1
     }
     if !write_lock(loaded.root, loaded.graph) {
@@ -450,7 +448,7 @@ fn cmd_build(f: Flags): i32 with (a: mem.Allocator) {
 
 private fn run_in(f: Flags, args: []str): i32 with (a: mem.Allocator) {
     var (loaded, ok) = load()
-    if !ok {
+    if ok != null {
         return 1
     }
     if !write_lock(loaded.root, loaded.graph) {
@@ -486,7 +484,7 @@ fn cmd_run(f: Flags, args: []str): i32 with (a: mem.Allocator) {
 
 private fn test_in(f: Flags): i32 with (a: mem.Allocator) {
     var (loaded, ok) = load()
-    if !ok {
+    if ok != null {
         return 1
     }
     if !write_lock(loaded.root, loaded.graph) {
@@ -513,7 +511,7 @@ fn cmd_test(f: Flags): i32 with (a: mem.Allocator) {
 
 private fn pack_in(f: Flags): i32 with (a: mem.Allocator) {
     var (loaded, ok) = load()
-    if !ok {
+    if ok != null {
         return 1
     }
     if !write_lock(loaded.root, loaded.graph) {
@@ -539,7 +537,7 @@ private fn pack_in(f: Flags): i32 with (a: mem.Allocator) {
         return code
     }
     var (path, sum, pok) = pack.pack(loaded.root, f.output, loaded.graph)
-    if !pok {
+    if pok != null {
         return 1
     }
     io.println(path)
@@ -559,7 +557,7 @@ fn cmd_pack(f: Flags): i32 with (a: mem.Allocator) {
 
 private fn deps_in(f: Flags): i32 with (a: mem.Allocator) {
     var (loaded, ok) = load()
-    if !ok {
+    if ok != null {
         return 1
     }
     if !write_lock(loaded.root, loaded.graph) {
@@ -583,7 +581,7 @@ private fn deps_in(f: Flags): i32 with (a: mem.Allocator) {
         line.append(" ")
         val ver = manifest.version_text(n.version)
         line.append(ver)
-        text.free_str(ver)
+        fs.free_str(ver)
         line.append(" ")
         line.append(resolve.source_name(n.source))
         line.append(" ")
@@ -651,13 +649,13 @@ fn run(): i32 with (a: mem.Allocator) {
     var i: i64 = 0
     val n = os.argc()
     for i < n {
-        args.push(text.copy_str(os.argv(i)))
+        args.push(fs.copy_str(os.argv(i)))
         i = i + 1
     }
     val code = dispatch(args.slice_view())
     var k: usize = 0
     for k < args.len {
-        text.free_str(args.get(k))
+        fs.free_str(args.get(k))
         k = k + 1
     }
     args.free()

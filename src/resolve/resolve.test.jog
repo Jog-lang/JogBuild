@@ -4,8 +4,9 @@ import std.mem
 import std.os
 import std.testing
 
+import src.host
 import src.manifest
-import src.text
+import std.text
 
 fn parent_of(path: str): str with (a: mem.Allocator) {
     var i = path.len
@@ -13,7 +14,7 @@ fn parent_of(path: str): str with (a: mem.Allocator) {
         i = i - 1
         val c = path.ptr[i]
         if c == '/' as u8 || c == '\\' as u8 {
-            return text.copy_str(text.view_range(path, 0, i))
+            return fs.copy_str(text.slice(path, 0, i))
         }
     }
     return ""
@@ -23,7 +24,7 @@ fn repo_root(): str with (a: mem.Allocator) {
     val exe = os.argv(0)
     val out_dir = parent_of(exe)
     val root = parent_of(out_dir)
-    text.free_str(out_dir)
+    fs.free_str(out_dir)
     return root
 }
 
@@ -40,9 +41,9 @@ fn app_dir(folder: str): str with (a: mem.Allocator) {
     val graph = fs.join(root, "testdata/graph")
     val base = fs.join(graph, folder)
     val app = fs.join(base, "app")
-    text.free_str(root)
-    text.free_str(graph)
-    text.free_str(base)
+    fs.free_str(root)
+    fs.free_str(graph)
+    fs.free_str(base)
     return app
 }
 
@@ -52,7 +53,11 @@ fn path_normalization() with (t: testing.Testing) {
     with (&ar) {
         t.expectEq(absolute("D:/ignored", "D:/x/../y/./z"), "D:/y/z")
         t.expectEq(absolute("D:\\a\\app", "..\\lib"), "D:/a/lib")
-        t.expect(same_folder("D:/a/lib", "d:/a/lib"))
+        if host.fold_case() {
+            t.expect(same_folder("D:/a/lib", "d:/a/lib"))
+        } else {
+            t.expect(!same_folder("D:/a/lib", "d:/a/lib"))
+        }
         val root = repo_root()
         val a = fs.join(root, "testdata/graph/diamond/a")
         val b = fs.join(root, "testdata/graph/diamond/b")
@@ -75,8 +80,8 @@ fn missing_version_message() with (t: testing.Testing) {
 
 fn resolves(folder: str): bool with (a: mem.Allocator) {
     val app = app_dir(folder)
-    var (g, ok) = resolve(app, jog_ver())
-    return ok
+    var (g, err) = resolve(app, jog_ver())
+    return err == null
 }
 
 @test
@@ -84,8 +89,8 @@ fn diamond_orders_c_first() with (t: testing.Testing) {
     var ar = arena.init(0)
     with (&ar) {
         val app = app_dir("diamond")
-        var (g, ok) = resolve(app, jog_ver())
-        t.expect(ok)
+        var (g, err) = resolve(app, jog_ver())
+        t.expect(err == null)
         t.expect(g.nodes.len == 3)
         if g.nodes.len == 3 {
             t.expect(g.nodes.get(0).name == "c")

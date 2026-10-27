@@ -1,0 +1,57 @@
+// Package src.host: the differences between Windows and POSIX.
+// Core declares them. host.windows.jog and host.posix.jog supply the
+// bodies. posix is loaded for linux and macos. jog.mod lists
+// targets windows linux macos, so each expect has exactly one actual
+// on every target. The current host is the one that is compiled.
+
+/**
+ * The byte that separates entries in PATH.
+ * @return ';' on Windows, ':' on POSIX
+ */
+expect fn path_sep(): u8
+
+/**
+ * The compiler's file name on PATH.
+ * @return "jog.exe" on Windows, "jog" on POSIX
+ */
+expect fn compiler_file(): str
+
+/**
+ * True on Windows. The zip tool check uses this and does not run elsewhere.
+ * @return whether the host is Windows
+ */
+expect fn windows(): bool
+
+/**
+ * True when two paths that differ only in case name the same folder.
+ * @return true on Windows
+ */
+expect fn fold_case(): bool
+
+/**
+ * Create one directory. Parents are not created. An existing directory is false.
+ * @param path the directory
+ * @return false when the path is empty, too long, or the OS refuses
+ */
+expect fn mkdir(path: str): bool
+
+/**
+ * Delete a file. A missing file is ignored.
+ * @param path the file
+ */
+expect fn remove_file(path: str)
+
+/**
+ * Remove an empty directory. A missing directory is ignored.
+ * @param path the directory
+ */
+expect fn remove_dir(path: str)
+
+/**
+ * The default cache root when JOG_CACHE is unset. Empty when the home
+ * variable is unset. Windows uses LOCALAPPDATA/jog/cache. POSIX uses
+ * XDG_CACHE_HOME/jog, or HOME/.cache/jog.
+ * @context a allocator for the path
+ * @return an owned path, or empty
+ */
+expect fn cache_dir(): str with (a: mem.Allocator)

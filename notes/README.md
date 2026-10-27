@@ -1,6 +1,6 @@
 # Notes
 
-The notes this folder used to hold now live in JogDocs, at `D:/Projects/Jog/JogDocs` ([github.com/Jog-lang/JogDocs](https://github.com/Jog-lang/JogDocs)). Edit them there, not here.
+The notes this folder used to hold now live in [JogDocs](https://github.com/Jog-lang/JogDocs). Edit them there, not here.
 
 - `projects/JogBuild/Plan.md`: the implementation plan, eleven milestones, and the open points found in the spec. Start here.
 - `projects/JogBuild/Checks.md`: one checklist per milestone, with the commands.

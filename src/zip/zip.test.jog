@@ -3,7 +3,6 @@
 // Windows checks shell out to tar and PowerShell 7; proc.run does not
 // search PATH, so the executables are absolute.
 
-import std.c
 import std.fs
 import std.io
 import std.list
@@ -12,6 +11,8 @@ import std.os
 import std.proc
 import std.strbuilder
 import std.testing
+
+import src.host
 
 private fn text_bytes(text: str): bytes {
     var data = bytes()
@@ -397,14 +398,7 @@ private fn repo_root(): str {
 }
 
 private fn ensure_dir(path: str) {
-    if path.len == 0 || path.len >= 4096 {
-        return
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    c.CreateDirectoryW(wide[..].ptr, 0)
+    host.mkdir(path)
 }
 
 private fn contains_text(hay: str, needle: str): bool {
@@ -438,8 +432,8 @@ private fn as_text(data: bytes): str {
     return out
 }
 
-private fn cmd_ok(out: proc.Output, label: str) with (t: testing.Testing) {
-    if out.ok && out.code == 0 {
+private fn cmd_ok(out: proc.Output, err: error?, label: str) with (t: testing.Testing) {
+    if err == null && out.code == 0 {
         return
     }
     io.eprint(label)
@@ -451,6 +445,9 @@ private fn cmd_ok(out: proc.Output, label: str) with (t: testing.Testing) {
 
 @test
 fn windowsTools() with (t: testing.Testing) {
+    if !host.windows() {
+        return
+    }
     with (mem.heap()) {
         val root = repo_root()
         val out_dir = fs.join(root, "out")
@@ -461,14 +458,14 @@ fn windowsTools() with (t: testing.Testing) {
         ensure_dir(in_dir)
         val a_txt = fs.join(in_dir, "a.txt")
         val b_txt = fs.join(in_dir, "b.txt")
-        t.expect(fs.write_all(a_txt, text_bytes("alpha")))
-        t.expect(fs.write_all(b_txt, text_bytes("beta")))
+        t.expect(fs.write_all(a_txt, text_bytes("alpha")) == null)
+        t.expect(fs.write_all(b_txt, text_bytes("beta")) == null)
         var xs: list.List<Entry>
         push_entry(&xs, "a.txt", "alpha")
         push_entry(&xs, "b.txt", "beta")
         val arc = write(xs.slice_view())
         val two = fs.join(test_dir, "two.zip")
-        t.expect(fs.write_all(two, arc))
+        t.expect(fs.write_all(two, arc) == null)
         val expanded = fs.join(test_dir, "two")
         var expand_cmd = strbuilder.empty()
         expand_cmd.append("Expand-Archive -Force -Path '")
@@ -479,22 +476,22 @@ fn windowsTools() with (t: testing.Testing) {
         val expand_text = copy_text(expand_cmd.str())
         expand_cmd.free()
         val pwsh = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
-        val expanded_run = proc.run([]str(pwsh, "-NoProfile", "-Command", expand_text))
-        cmd_ok(expanded_run, "Expand-Archive")
+        var (expanded_run, expand_err) = proc.run([]str(pwsh, "-NoProfile", "-Command", expand_text))
+        cmd_ok(expanded_run, expand_err, "Expand-Archive")
         proc.free_output(expanded_run)
         val got_a = fs.join(expanded, "a.txt")
         val got_b = fs.join(expanded, "b.txt")
-        val (bytes_a, ok_a) = fs.read_all(got_a)
-        val (bytes_b, ok_b) = fs.read_all(got_b)
-        t.expect(ok_a)
-        t.expect(ok_b)
+        val (bytes_a, err_a) = fs.read_all(got_a)
+        val (bytes_b, err_b) = fs.read_all(got_b)
+        t.expect(err_a == null)
+        t.expect(err_b == null)
         t.expect(same_bytes(bytes_a, text_bytes("alpha")))
         t.expect(same_bytes(bytes_b, text_bytes("beta")))
         free_bytes(bytes_a)
         free_bytes(bytes_b)
         val tar = "C:\\Windows\\System32\\tar.exe"
-        val listed = proc.run([]str(tar, "-tf", two))
-        cmd_ok(listed, "tar -tf")
+        var (listed, list_err) = proc.run([]str(tar, "-tf", two))
+        cmd_ok(listed, list_err, "tar -tf")
         val listing = as_text(listed.stdout)
         t.expect(contains_text(listing, "a.txt"))
         t.expect(contains_text(listing, "b.txt"))
@@ -510,11 +507,11 @@ fn windowsTools() with (t: testing.Testing) {
         ps_cmd.append("'")
         val ps_text = copy_text(ps_cmd.str())
         ps_cmd.free()
-        val compressed = proc.run([]str(pwsh, "-NoProfile", "-Command", ps_text))
-        cmd_ok(compressed, "Compress-Archive")
+        var (compressed, compress_err) = proc.run([]str(pwsh, "-NoProfile", "-Command", ps_text))
+        cmd_ok(compressed, compress_err, "Compress-Archive")
         proc.free_output(compressed)
-        val (ps_bytes, ps_ok) = fs.read_all(ps_zip)
-        t.expect(ps_ok)
+        val (ps_bytes, ps_err) = fs.read_all(ps_zip)
+        t.expect(ps_err == null)
         val (ps_entries, ps_msg, ps_read) = read(ps_bytes)
         if !ps_read {
             io.eprint(ps_msg)
@@ -550,11 +547,11 @@ fn windowsTools() with (t: testing.Testing) {
         free_text(ps_msg)
         free_bytes(ps_bytes)
         val tar_zip = fs.join(test_dir, "tar.zip")
-        val tar_run = proc.run([]str(tar, "-a", "-cf", tar_zip, "-C", in_dir, "--options", "zip:compression=store", "a.txt", "b.txt"))
-        cmd_ok(tar_run, "tar store")
+        var (tar_run, tar_err) = proc.run([]str(tar, "-a", "-cf", tar_zip, "-C", in_dir, "--options", "zip:compression=store", "a.txt", "b.txt"))
+        cmd_ok(tar_run, tar_err, "tar store")
         proc.free_output(tar_run)
-        val (tar_bytes, tar_ok) = fs.read_all(tar_zip)
-        t.expect(tar_ok)
+        val (tar_bytes, tar_read_err) = fs.read_all(tar_zip)
+        t.expect(tar_read_err == null)
         val (tar_entries, tar_msg, tar_read) = read(tar_bytes)
         release(tar_entries)
         if tar_read {

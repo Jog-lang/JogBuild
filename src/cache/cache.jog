@@ -5,19 +5,19 @@
 //     <cache>/mod/<module>/<version>/src/...
 //     <cache>/tmp/                     unpacking in progress
 //
-// <cache> is JOG_CACHE when it is set and non-empty, else
-// %LOCALAPPDATA%\jog\cache on Windows. A module folder is immutable once
-// it exists. install unpacks into a fresh folder under tmp/, verifies
-// every CRC and the content hash, then renames it into place. A folder
-// that already exists with a different hash in its manifest is an error.
-// Milestone 9 of notes/Plan.md.
+// <cache> is JOG_CACHE when it is set and non-empty. Otherwise it is
+// the host default from src.host: LOCALAPPDATA/jog/cache on Windows,
+// XDG_CACHE_HOME/jog or HOME/.cache/jog on Linux and macOS. A module
+// folder is immutable once it exists. install unpacks into a fresh
+// folder under tmp/, verifies every CRC and the content hash, then
+// renames it into place with fs.rename. A folder that already exists
+// with a different hash in its manifest is an error. An existing
+// target makes the rename fail. Milestone 9 of notes/Plan.md.
 //
 // Every function takes the cache root as a parameter. Only dir reads
-// the environment. MoveFileExA is not in std.c, so it is declared here
-// (CTools Friction.md). Flags are 0, so a rename fails when the target
-// exists.
+// the environment. Creating and deleting directories goes through
+// src.host, so the same code runs on Windows and POSIX.
 
-import std.c
 import std.fs
 import std.io
 import std.list
@@ -25,14 +25,12 @@ import std.mem
 import std.os
 import std.strbuilder
 
+import src.fail
 import src.hash
+import src.host
 import src.manifest
-import src.text
 import src.zip
-
-private extern {
-    fn MoveFileExA(existing: *const c.char, dest: *const c.char, flags: c.unsigned_long): c.int
-}
+import std.text
 
 struct ArchiveManifest {
     archive: i64
@@ -42,7 +40,7 @@ struct ArchiveManifest {
 
 fn free_manifest(am: *ArchiveManifest) with (a: mem.Allocator) {
     manifest.free(&am.m)
-    text.free_str(am.hash)
+    fs.free_str(am.hash)
     am.hash = ""
     am.archive = 0
 }
@@ -52,18 +50,9 @@ fn free_manifest(am: *ArchiveManifest) with (a: mem.Allocator) {
 fn dir(): str with (a: mem.Allocator) {
     var (cache_env, ok) = os.env("JOG_CACHE")
     if ok && cache_env.len > 0 {
-        return text.copy_str(cache_env)
+        return fs.copy_str(cache_env)
     }
-    var (local, lok) = os.env("LOCALAPPDATA")
-    if !lok || local.len == 0 {
-        return ""
-    }
-    val local_copy = text.copy_str(local)
-    val jog = fs.join(local_copy, "jog")
-    val root = fs.join(jog, "cache")
-    text.free_str(local_copy)
-    fs.free_str(jog)
-    return root
+    return host.cache_dir()
 }
 
 fn module_dir(root: str, name: str, version: str): str with (a: mem.Allocator) {
@@ -86,12 +75,12 @@ fn has(root: str, name: str, version: str): bool with (a: mem.Allocator) {
     val base = module_dir(root, name, version)
     val path = fs.join(base, "manifest")
     fs.free_str(base)
-    var (data, ok) = fs.read_all(path)
+    var (data, err) = fs.read_all(path)
     fs.free_str(path)
-    if ok && data.len > 0 {
+    if err == null && data.len > 0 {
         a.free(data)
     }
-    return ok
+    return err == null
 }
 
 private fn line_words(line: str): list.List<str> with (a: mem.Allocator) {
@@ -114,7 +103,7 @@ private fn line_words(line: str): list.List<str> with (a: mem.Allocator) {
             }
             i = i + 1
         }
-        words.push(text.view_range(line, start, i))
+        words.push(text.slice(line, start, i))
     }
     return words
 }
@@ -136,7 +125,13 @@ private fn hash_ok(sum: str): bool {
     return true
 }
 
-fn read_archive_manifest(src: str): (ArchiveManifest, bool) with (a: mem.Allocator) {
+/**
+ * Parse an archive manifest. A bad archive line is printed here.
+ * @param src manifest text, including the jog.mod body
+ * @context a allocator for the owned strings
+ * @return the manifest, or ErrReported
+ */
+fn read_archive_manifest(src: str): (ArchiveManifest, error?) with (a: mem.Allocator) {
     var am: ArchiveManifest
     var body = strbuilder.empty()
     var saw_archive = false
@@ -151,7 +146,7 @@ fn read_archive_manifest(src: str): (ArchiveManifest, bool) with (a: mem.Allocat
         for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
             at = at + 1
         }
-        val line = text.view_range(src, start, at)
+        val line = text.slice(src, start, at)
         if at < src.len && src.ptr[at] == '\r' as u8 {
             at = at + 1
         }
@@ -180,7 +175,7 @@ fn read_archive_manifest(src: str): (ArchiveManifest, bool) with (a: mem.Allocat
                 failed = true
             } else {
                 saw_hash = true
-                am.hash = text.copy_str(words.get(1))
+                am.hash = fs.copy_str(words.get(1))
             }
         } else if !saw_archive {
             io.eprintln("jog-build: archive manifest must start with 'archive 1'")
@@ -198,70 +193,64 @@ fn read_archive_manifest(src: str): (ArchiveManifest, bool) with (a: mem.Allocat
             io.eprintln("jog-build: archive manifest has no hash")
         }
         body.free()
-        text.free_str(am.hash)
+        fs.free_str(am.hash)
         var blank: ArchiveManifest
-        return blank, false
+        return blank, fail.ErrReported
     }
-    val body_text = text.copy_str(body.str())
+    val body_text = fs.copy_str(body.str())
     body.free()
     var (m, err, pok) = manifest.parse(body_text)
-    text.free_str(body_text)
+    fs.free_str(body_text)
     if !pok {
         io.eprintln(err.message)
-        text.free_str(am.hash)
+        fs.free_str(am.hash)
         var blank: ArchiveManifest
-        return blank, false
+        return blank, fail.ErrReported
     }
     if !m.has_version || !m.library {
         io.eprintln("jog-build: archive manifest needs a version and kind library")
         manifest.free(&m)
-        text.free_str(am.hash)
+        fs.free_str(am.hash)
         var blank: ArchiveManifest
-        return blank, false
+        return blank, fail.ErrReported
     }
     am.m = m
-    return am, true
+    return am, null
 }
 
-fn stored(root: str, name: str, version: str): (ArchiveManifest, bool) with (a: mem.Allocator) {
+/**
+ * Read one cached archive manifest.
+ * @param root cache root
+ * @param name module name
+ * @param version MAJOR.MINOR.PATCH
+ * @context a allocator for the manifest
+ * @return the manifest, the read error, or ErrReported when the text is bad
+ */
+fn stored(root: str, name: str, version: str): (ArchiveManifest, error?) with (a: mem.Allocator) {
     var blank: ArchiveManifest
     val base = module_dir(root, name, version)
     val path = fs.join(base, "manifest")
     fs.free_str(base)
-    var (data, ok) = fs.read_all(path)
+    var (data, err) = fs.read_all(path)
     fs.free_str(path)
-    if !ok {
-        return blank, false
+    if err != null {
+        return blank, err
     }
     val src: str = data
     var (am, pok) = read_archive_manifest(src)
     a.free(data)
-    if !pok {
-        return blank, false
+    if pok != null {
+        return blank, pok
     }
-    return am, true
+    return am, null
 }
 
 private fn ensure_dir(path: str) {
-    if path.len == 0 || path.len >= 4096 {
-        return
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    c.CreateDirectoryW(wide[..].ptr, 0)
+    host.mkdir(path)
 }
 
 private fn mkdir_one(path: str): bool {
-    if path.len == 0 || path.len >= 4096 {
-        return false
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return false
-    }
-    return c.CreateDirectoryW(wide[..].ptr, 0) != 0
+    return host.mkdir(path)
 }
 
 private fn mkdir_all(path: str): bool with (a: mem.Allocator) {
@@ -275,7 +264,7 @@ private fn mkdir_all(path: str): bool with (a: mem.Allocator) {
     for i < path.len {
         val c = path.ptr[i]
         if (c == '/' as u8 || c == '\\' as u8) && i > 0 {
-            ensure_dir(text.view_range(path, 0, i))
+            ensure_dir(text.slice(path, 0, i))
         }
         i = i + 1
     }
@@ -294,37 +283,20 @@ private fn parent_of(path: str): str {
         val c = path.ptr[i]
         if c == '/' as u8 || c == '\\' as u8 {
             if i == 0 {
-                return text.view_range(path, 0, 1)
+                return text.slice(path, 0, 1)
             }
-            return text.view_range(path, 0, i)
+            return text.slice(path, 0, i)
         }
     }
     return ""
 }
 
-private fn fill_path(path: str, dest: *u8): bool {
-    if path.len == 0 || path.len >= 4096 {
-        return false
-    }
-    c.memcpy(dest as *void, path.ptr as *const void, path.len)
-    *(dest + path.len) = 0
-    return true
-}
-
 private fn delete_file(path: str) {
-    var wide: [4096]u16
-    if path.len == 0 || !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    c.DeleteFileW(wide[..].ptr)
+    host.remove_file(path)
 }
 
 private fn remove_dir(path: str) {
-    var wide: [4096]u16
-    if path.len == 0 || !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    c.RemoveDirectoryW(wide[..].ptr)
+    host.remove_dir(path)
 }
 
 private fn remove_tree(path: str) with (a: mem.Allocator) {
@@ -345,13 +317,7 @@ private fn remove_tree(path: str) with (a: mem.Allocator) {
 }
 
 private fn move_dir(from: str, to: str): bool {
-    var from_buf: [4096]u8
-    var to_buf: [4096]u8
-    if !fill_path(from, from_buf[..].ptr) || !fill_path(to, to_buf[..].ptr) {
-        return false
-    }
-    val flags: c.unsigned_long = 0
-    return MoveFileExA(from_buf[..].ptr as *const c.char, to_buf[..].ptr as *const c.char, flags) != 0
+    return fs.rename(from, to) == null
 }
 
 private fn make_tmp(root: str, module: str, version: str): str with (a: mem.Allocator) {
@@ -371,13 +337,13 @@ private fn make_tmp(root: str, module: str, version: str): str with (a: mem.Allo
         b.append(version)
         b.append("-")
         b.append_int(n, 10)
-        val candidate = text.copy_str(b.str())
+        val candidate = fs.copy_str(b.str())
         b.free()
         if mkdir_one(candidate) {
             chosen = candidate
             break
         }
-        text.free_str(candidate)
+        fs.free_str(candidate)
         n = n + 1
     }
     fs.free_str(tmp_root)
@@ -393,7 +359,7 @@ private fn write_rel(root: str, rel: str, data: bytes): bool with (a: mem.Alloca
     }
     var wrote = false
     if made {
-        wrote = fs.write_all(full, data)
+        wrote = fs.write_all(full, data) == null
     }
     if !wrote {
         io.eprint("jog-build: cannot write ")
@@ -425,13 +391,13 @@ private fn name_before(left: str, right: str): bool {
 
 private fn rel_join(prefix: str, name: str): str with (a: mem.Allocator) {
     if prefix.len == 0 {
-        return text.copy_str(name)
+        return fs.copy_str(name)
     }
     var b = strbuilder.empty()
     b.append(prefix)
     b.append("/")
     b.append(name)
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
@@ -440,7 +406,7 @@ private fn free_files(files: *list.List<hash.File>) with (a: mem.Allocator) {
     var i: usize = 0
     for i < files.len {
         val f = files.get(i)
-        text.free_str(f.name)
+        fs.free_str(f.name)
         if f.data.len > 0 {
             a.free(f.data)
         }
@@ -469,10 +435,10 @@ private fn collect_files(dir: str, prefix: str, files: *list.List<hash.File>): b
             if !collect_files(child, rel, files) {
                 failed = true
             }
-            text.free_str(rel)
+            fs.free_str(rel)
         } else {
-            var (data, rok) = fs.read_all(child)
-            if !rok {
+            var (data, err) = fs.read_all(child)
+            if err != null {
                 failed = true
             } else {
                 var f: hash.File
@@ -543,14 +509,22 @@ private fn as_text(data: bytes): str {
     return out
 }
 
-fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allocator) {
+/**
+ * Unpack a .jogz into the cache. The same hash already stored is success.
+ * A different hash for the same name and version is printed and rejected.
+ * @param root cache root
+ * @param jogz_path archive path
+ * @context a allocator for the unpacked files
+ * @return the archive manifest, a read error, or ErrReported
+ */
+fn install(root: str, jogz_path: str): (ArchiveManifest, error?) with (a: mem.Allocator) {
     var blank: ArchiveManifest
-    var (data, rok) = fs.read_all(jogz_path)
-    if !rok {
+    var (data, err) = fs.read_all(jogz_path)
+    if err != null {
         io.eprint("jog-build: cannot read archive '")
         io.eprint(jogz_path)
         io.eprintln("'")
-        return blank, false
+        return blank, err
     }
     var (entries, msg, zok) = zip.read(data)
     if !zok {
@@ -560,7 +534,7 @@ fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allo
         io.eprintln(msg)
         zip.free_text(msg)
         release_zip(entries, data)
-        return blank, false
+        return blank, fail.ErrReported
     }
     var saw_man = false
     var man_data = bytes()
@@ -578,36 +552,37 @@ fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allo
         io.eprint(jogz_path)
         io.eprintln("' has no manifest entry")
         release_zip(entries, data)
-        return blank, false
+        return blank, fail.ErrReported
     }
     var (am, pok) = read_archive_manifest(as_text(man_data))
-    if !pok {
+    if pok != null {
         release_zip(entries, data)
-        return blank, false
+        return blank, pok
     }
     val ver = manifest.version_text(am.m.version)
     var (old, exists) = stored(root, am.m.module, ver)
-    if exists {
+    // null means this name and version is already in the cache.
+    if exists == null {
         val same = old.hash == am.hash
         if !same {
             different_archives(am.m.module, ver)
         }
         free_manifest(&old)
-        text.free_str(ver)
+        fs.free_str(ver)
         release_zip(entries, data)
         if same {
-            return am, true
+            return am, null
         }
         free_manifest(&am)
-        return blank, false
+        return blank, fail.ErrReported
     }
     val tmp = make_tmp(root, am.m.module, ver)
     if tmp.len == 0 {
         io.eprintln("jog-build: cannot create a cache temp directory")
-        text.free_str(ver)
+        fs.free_str(ver)
         release_zip(entries, data)
         free_manifest(&am)
-        return blank, false
+        return blank, fail.ErrReported
     }
     var wrote = write_rel(tmp, "manifest", man_data)
     i = 0
@@ -624,24 +599,24 @@ fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allo
     release_zip(entries, data)
     if !wrote {
         remove_tree(tmp)
-        text.free_str(tmp)
-        text.free_str(ver)
+        fs.free_str(tmp)
+        fs.free_str(ver)
         free_manifest(&am)
-        return blank, false
+        return blank, fail.ErrReported
     }
     val src = fs.join(tmp, "src")
     var (got, hok) = hash_dir(src)
     fs.free_str(src)
     if !hok || got != am.hash {
         io.eprintln("jog-build: content hash does not match the manifest")
-        text.free_str(got)
+        fs.free_str(got)
         remove_tree(tmp)
-        text.free_str(tmp)
-        text.free_str(ver)
+        fs.free_str(tmp)
+        fs.free_str(ver)
         free_manifest(&am)
-        return blank, false
+        return blank, fail.ErrReported
     }
-    text.free_str(got)
+    fs.free_str(got)
     val dest = module_dir(root, am.m.module, ver)
     val parent = parent_of(dest)
     val parent_ok = mkdir_all(parent)
@@ -651,20 +626,21 @@ fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allo
     }
     if moved {
         fs.free_str(dest)
-        text.free_str(tmp)
-        text.free_str(ver)
-        return am, true
+        fs.free_str(tmp)
+        fs.free_str(ver)
+        return am, null
     }
     var (raced, rok2) = stored(root, am.m.module, ver)
-    if rok2 && raced.hash == am.hash {
+    // The move lost a race. The same hash already stored is still success.
+    if rok2 == null && raced.hash == am.hash {
         free_manifest(&raced)
         remove_tree(tmp)
         fs.free_str(dest)
-        text.free_str(tmp)
-        text.free_str(ver)
-        return am, true
+        fs.free_str(tmp)
+        fs.free_str(ver)
+        return am, null
     }
-    if rok2 {
+    if rok2 == null {
         different_archives(am.m.module, ver)
         free_manifest(&raced)
         remove_tree(tmp)
@@ -672,8 +648,8 @@ fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allo
         io.eprintln("jog-build: cannot move the cache temp directory into place")
     }
     fs.free_str(dest)
-    text.free_str(tmp)
-    text.free_str(ver)
+    fs.free_str(tmp)
+    fs.free_str(ver)
     free_manifest(&am)
-    return blank, false
+    return blank, fail.ErrReported
 }

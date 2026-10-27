@@ -15,18 +15,19 @@
 // 5. Compute the content hash over src/, write the manifest entry,
 //    write the zip, print the path and the hash.
 
-import std.c
 import std.fs
 import std.io
 import std.list
 import std.mem
 import std.strbuilder
 
+import src.fail
 import src.hash
+import src.host
 import src.manifest
 import src.resolve
-import src.text
 import src.zip
+import std.text
 
 struct Collected {
     names: list.List<str>
@@ -44,14 +45,7 @@ private fn as_bytes(s: str): bytes {
 }
 
 private fn ensure_dir(path: str) {
-    if path.len == 0 || path.len >= 4096 {
-        return
-    }
-    var wide: [4096]u16
-    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
-        return
-    }
-    c.CreateDirectoryW(wide[..].ptr, 0)
+    host.mkdir(path)
 }
 
 private fn parent_of(path: str): str {
@@ -61,9 +55,9 @@ private fn parent_of(path: str): str {
         val c = path.ptr[i]
         if c == '/' as u8 || c == '\\' as u8 {
             if i == 0 {
-                return text.view_range(path, 0, 1)
+                return text.slice(path, 0, 1)
             }
-            return text.view_range(path, 0, i)
+            return text.slice(path, 0, i)
         }
     }
     return ""
@@ -91,13 +85,13 @@ private fn name_before(left: str, right: str): bool {
 
 private fn rel_join(prefix: str, name: str): str with (a: mem.Allocator) {
     if prefix.len == 0 {
-        return text.copy_str(name)
+        return fs.copy_str(name)
     }
     var b = strbuilder.empty()
     b.append(prefix)
     b.append("/")
     b.append(name)
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
@@ -120,7 +114,7 @@ private fn free_collected(c: *Collected) with (a: mem.Allocator) {
         n = c.data.len
     }
     for i < n {
-        text.free_str(c.names.get(i))
+        fs.free_str(c.names.get(i))
         val blob = c.data.get(i)
         if blob.len > 0 {
             a.free(blob)
@@ -186,12 +180,12 @@ private fn walk(dir: str, prefix: str, c: *Collected): bool with (a: mem.Allocat
                 if !walk(child, rel, c) {
                     failed = true
                 }
-                text.free_str(rel)
+                fs.free_str(rel)
                 fs.free_str(child)
             }
         } else {
-            var (data, rok) = fs.read_all(child)
-            if !rok {
+            var (data, err) = fs.read_all(child)
+            if err != null {
                 io.eprint("jog-build pack: cannot read ")
                 io.eprintln(child)
                 fs.free_str(child)
@@ -230,7 +224,7 @@ private fn is_require_line(line: str): bool {
     if i >= line.len || line.ptr[i] == '#' as u8 {
         return false
     }
-    val rest = text.view_range(line, i, line.len)
+    val rest = text.slice(line, i, line.len)
     if !text.starts_with(rest, "require") {
         return false
     }
@@ -275,7 +269,7 @@ fn rewrite_jog_mod(src: str, g: resolve.Graph): (str, bool) with (a: mem.Allocat
         for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
             at = at + 1
         }
-        val line = text.view_range(src, start, at)
+        val line = text.slice(src, start, at)
         val end = at
         if at < src.len && src.ptr[at] == '\r' as u8 {
             at = at + 1
@@ -293,7 +287,7 @@ fn rewrite_jog_mod(src: str, g: resolve.Graph): (str, bool) with (a: mem.Allocat
             if r.is_path {
                 var (ver, vok) = dep_version(g, r.module)
                 if !vok {
-                    text.free_str(ver)
+                    fs.free_str(ver)
                     failed = true
                     break
                 }
@@ -301,15 +295,15 @@ fn rewrite_jog_mod(src: str, g: resolve.Graph): (str, bool) with (a: mem.Allocat
                 b.append(r.module)
                 b.append(" ")
                 b.append(ver)
-                text.free_str(ver)
+                fs.free_str(ver)
                 if end < at {
-                    b.append(text.view_range(src, end, at))
+                    b.append(text.slice(src, end, at))
                 }
             } else {
-                b.append(text.view_range(src, start, at))
+                b.append(text.slice(src, start, at))
             }
         } else {
-            b.append(text.view_range(src, start, at))
+            b.append(text.slice(src, start, at))
         }
     }
     if !failed && req_i != g.root.requires.len {
@@ -319,7 +313,7 @@ fn rewrite_jog_mod(src: str, g: resolve.Graph): (str, bool) with (a: mem.Allocat
         b.free()
         return "", false
     }
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out, true
 }
@@ -352,12 +346,12 @@ fn archive_manifest(m: manifest.Manifest, g: resolve.Graph, sum: str): (str, boo
         if r.is_path {
             var (ver, vok) = dep_version(g, r.module)
             if !vok {
-                text.free_str(ver)
+                fs.free_str(ver)
                 failed = true
                 break
             }
             b.append(ver)
-            text.free_str(ver)
+            fs.free_str(ver)
         } else {
             b.append(r.spec)
         }
@@ -378,7 +372,7 @@ fn archive_manifest(m: manifest.Manifest, g: resolve.Graph, sum: str): (str, boo
     b.append("hash ")
     b.append(sum)
     b.append("\n")
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out, true
 }
@@ -419,14 +413,14 @@ private fn src_name(rel: str): str with (a: mem.Allocator) {
     var b = strbuilder.empty()
     b.append("src/")
     b.append(rel)
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
 
 private fn output_path(root_dir: str, output: str, m: manifest.Manifest): str with (a: mem.Allocator) {
     if output.len > 0 {
-        return text.copy_str(output)
+        return fs.copy_str(output)
     }
     val ver = manifest.version_text(m.version)
     var b = strbuilder.empty()
@@ -434,53 +428,60 @@ private fn output_path(root_dir: str, output: str, m: manifest.Manifest): str wi
     b.append("-")
     b.append(ver)
     b.append(".jogz")
-    text.free_str(ver)
-    val file = text.copy_str(b.str())
+    fs.free_str(ver)
+    val file = fs.copy_str(b.str())
     b.free()
     val out_dir = fs.join(root_dir, "out")
     ensure_dir(out_dir)
     val path = fs.join(out_dir, file)
     fs.free_str(out_dir)
-    text.free_str(file)
+    fs.free_str(file)
     return path
 }
 
-// Returns the archive path and the content hash. output is the -o path,
-// or empty to write out/<name>-<version>.jogz next to jog.mod.
-fn pack(root_dir: str, output: str, g: resolve.Graph): (str, str, bool) with (a: mem.Allocator) {
+/**
+ * Pack a resolved library. output empty writes out/<name>-<version>.jogz
+ * next to jog.mod. A failure is already printed.
+ * @param root_dir module root
+ * @param output -o path, or empty
+ * @param g resolved graph
+ * @context a allocator for the archive and the hash
+ * @return the archive path, the content hash, and a read error or ErrReported
+ */
+fn pack(root_dir: str, output: str, g: resolve.Graph): (str, str, error?) with (a: mem.Allocator) {
     var (c, cok) = collect(root_dir)
     if !cok {
         free_collected(&c)
-        return "", "", false
+        return "", "", fail.ErrReported
     }
     val mod_path = fs.join(root_dir, "jog.mod")
-    var (mod_bytes, mok) = fs.read_all(mod_path)
+    var (mod_bytes, err) = fs.read_all(mod_path)
     fs.free_str(mod_path)
-    if !mok {
+    if err != null {
         io.eprintln("jog-build pack: cannot read jog.mod")
         free_collected(&c)
-        return "", "", false
+        return "", "", err
     }
     val mod_src: str = mod_bytes
     var (rewritten, rok) = rewrite_jog_mod(mod_src, g)
     a.free(mod_bytes)
     if !rok {
-        text.free_str(rewritten)
+        fs.free_str(rewritten)
         free_collected(&c)
-        return "", "", false
+        return "", "", fail.ErrReported
     }
     if !take_rewritten(&c, rewritten) {
-        text.free_str(rewritten)
+        fs.free_str(rewritten)
         free_collected(&c)
-        return "", "", false
+        return "", "", fail.ErrReported
     }
     val sum = hash_collected(&c)
     var (man, aok) = archive_manifest(g.root, g, sum)
     if !aok {
-        text.free_str(man)
-        text.free_str(sum)
+        fs.free_str(man)
+        fs.free_str(sum)
         free_collected(&c)
-        return "", "", false
+        return "", "", fail.ErrReported
     }
     var names: list.List<str>
     var ents: list.List<zip.Entry>
@@ -504,23 +505,23 @@ fn pack(root_dir: str, output: str, g: resolve.Graph): (str, str, bool) with (a:
     if parent.len > 0 {
         ensure_dir(parent)
     }
-    val wrote = fs.write_all(path, arc)
+    val write_err = fs.write_all(path, arc)
     a.free(arc)
     var k: usize = 0
     for k < names.len {
-        text.free_str(names.get(k))
+        fs.free_str(names.get(k))
         k = k + 1
     }
     names.free()
     ents.free()
-    text.free_str(man)
+    fs.free_str(man)
     free_collected(&c)
-    if !wrote {
+    if write_err != null {
         io.eprint("jog-build pack: cannot write ")
         io.eprintln(path)
-        text.free_str(path)
-        text.free_str(sum)
-        return "", "", false
+        fs.free_str(path)
+        fs.free_str(sum)
+        return "", "", write_err
     }
-    return path, sum, true
+    return path, sum, null
 }

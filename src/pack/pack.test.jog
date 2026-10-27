@@ -10,7 +10,7 @@ import std.testing
 
 import src.manifest
 import src.resolve
-import src.text
+import std.text
 import src.zip
 
 private fn test_parent(path: str): str with (a: mem.Allocator) {
@@ -19,7 +19,7 @@ private fn test_parent(path: str): str with (a: mem.Allocator) {
         i = i - 1
         val c = path.ptr[i]
         if c == '/' as u8 || c == '\\' as u8 {
-            return text.copy_str(text.view_range(path, 0, i))
+            return fs.copy_str(text.slice(path, 0, i))
         }
     }
     return ""
@@ -29,7 +29,7 @@ private fn repo_root(): str with (a: mem.Allocator) {
     val exe = os.argv(0)
     val out_dir = test_parent(exe)
     val root = test_parent(out_dir)
-    text.free_str(out_dir)
+    fs.free_str(out_dir)
     return root
 }
 
@@ -45,7 +45,7 @@ private fn trim_nl(s: str): str {
     if s.len == 0 || s.ptr[s.len - 1] != '\n' as u8 {
         return s
     }
-    return text.view_range(s, 0, s.len - 1)
+    return text.slice(s, 0, s.len - 1)
 }
 
 private fn as_text(data: bytes): str {
@@ -61,17 +61,17 @@ fn pack_top_matches_fixtures() with (t: testing.Testing) {
     with (&ar) {
         val root = repo_root()
         val top = fs.join(root, "testdata/pack/top")
-        var (g, ok) = resolve.resolve(top, jog_ver())
-        t.expect(ok)
+        var (g, err) = resolve.resolve(top, jog_ver())
+        t.expect(err == null)
         val dest = fs.join(root, "out/test-pack/top.jogz")
         var (path, sum, pok) = pack(top, dest, g)
-        t.expect(pok)
+        t.expect(pok == null)
         val want_hash_path = fs.join(root, "testdata/pack/top.hash")
-        var (want_hash_bytes, hok) = fs.read_all(want_hash_path)
-        t.expect(hok)
+        var (want_hash_bytes, hash_err) = fs.read_all(want_hash_path)
+        t.expect(hash_err == null)
         t.expectEq(sum, trim_nl(want_hash_bytes))
-        var (arc, aok) = fs.read_all(path)
-        t.expect(aok)
+        var (arc, arc_err) = fs.read_all(path)
+        t.expect(arc_err == null)
         var (ents, msg, rok) = zip.read(arc)
         t.expect(rok)
         zip.free_text(msg)
@@ -88,12 +88,12 @@ fn pack_top_matches_fixtures() with (t: testing.Testing) {
             i = i + 1
         }
         val files_path = fs.join(root, "testdata/pack/top.files")
-        var (files_bytes, fok) = fs.read_all(files_path)
-        t.expect(fok)
+        var (files_bytes, files_err) = fs.read_all(files_path)
+        t.expect(files_err == null)
         t.expectEq(names.str(), as_text(files_bytes))
         val src_path = fs.join(root, "testdata/pack/top.src.jog.mod")
-        var (src_bytes, sok) = fs.read_all(src_path)
-        t.expect(sok)
+        var (src_bytes, src_err) = fs.read_all(src_path)
+        t.expect(src_err == null)
         t.expect(jog_mod.len == src_bytes.len)
         if jog_mod.len == src_bytes.len {
             var k: usize = 0
@@ -109,7 +109,7 @@ fn pack_top_matches_fixtures() with (t: testing.Testing) {
         }
         ents.free()
         names.free()
-        text.free_str(root)
+        fs.free_str(root)
         fs.free_str(top)
         fs.free_str(dest)
         fs.free_str(path)

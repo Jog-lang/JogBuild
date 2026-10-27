@@ -18,7 +18,7 @@ import std.strbuilder
 
 import src.manifest
 import src.resolve
-import src.text
+import std.text
 
 struct Entry {
     module: str
@@ -86,7 +86,7 @@ fn slash_spec(spec: str): str with (a: mem.Allocator) {
         b.append_byte(c)
         i = i + 1
     }
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
@@ -95,11 +95,11 @@ fn free_entries(xs: *list.List<Entry>) with (a: mem.Allocator) {
     var i: usize = 0
     for i < xs.len {
         val e = xs.get(i)
-        text.free_str(e.module)
-        text.free_str(e.version)
-        text.free_str(e.source)
-        text.free_str(e.location)
-        text.free_str(e.hash)
+        fs.free_str(e.module)
+        fs.free_str(e.version)
+        fs.free_str(e.source)
+        fs.free_str(e.location)
+        fs.free_str(e.hash)
         i = i + 1
     }
     xs.free()
@@ -111,19 +111,19 @@ fn entries(g: resolve.Graph): list.List<Entry> with (a: mem.Allocator) {
     for i < g.nodes.len {
         val n = g.nodes.get(i)
         var e: Entry
-        e.module = text.copy_str(n.name)
+        e.module = fs.copy_str(n.name)
         e.version = manifest.version_text(n.version)
         val kind = resolve.source_name(n.source)
-        e.source = text.copy_str(kind)
+        e.source = fs.copy_str(kind)
         if kind == "cache" {
-            e.location = text.copy_str("-")
+            e.location = fs.copy_str("-")
         } else {
             e.location = slash_spec(n.spec)
         }
         if kind == "path" {
-            e.hash = text.copy_str("-")
+            e.hash = fs.copy_str("-")
         } else {
-            e.hash = text.copy_str(n.hash)
+            e.hash = fs.copy_str(n.hash)
         }
         xs.push(e)
         i = i + 1
@@ -160,7 +160,7 @@ fn format(items: []Entry): str with (a: mem.Allocator) {
         i = i + 1
     }
     xs.free()
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
@@ -179,15 +179,23 @@ private fn same_bytes(data: bytes, body: str): bool {
     return true
 }
 
-fn write_if_changed(path: str, body: str): bool with (a: mem.Allocator) {
-    var (old, ok) = fs.read_all(path)
-    if ok {
+/**
+ * Write body when the file is missing or its bytes differ.
+ * A read error other than a missing file still tries the write.
+ * @param path lock path
+ * @param body full lock text
+ * @context a allocator for the old bytes
+ * @return null when the file already matched or the write worked
+ */
+fn write_if_changed(path: str, body: str): error? with (a: mem.Allocator) {
+    var (old, err) = fs.read_all(path)
+    if err == null {
         val same = same_bytes(old, body)
         if old.len > 0 {
             a.free(old)
         }
         if same {
-            return true
+            return null
         }
     }
     return fs.write_all(path, as_bytes(body))
@@ -209,7 +217,7 @@ fn parse(src: str): (list.List<Entry>, bool) with (a: mem.Allocator) {
         for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
             at = at + 1
         }
-        val line = text.view_range(src, start, at)
+        val line = text.slice(src, start, at)
         if at < src.len && src.ptr[at] == '\r' as u8 {
             at = at + 1
         }
@@ -231,7 +239,7 @@ fn parse(src: str): (list.List<Entry>, bool) with (a: mem.Allocator) {
             for i < line.len && line.ptr[i] != ' ' as u8 {
                 i = i + 1
             }
-            words.push(text.view_range(line, wstart, i))
+            words.push(text.slice(line, wstart, i))
         }
         if words.len == 0 {
             words.free()
@@ -249,11 +257,11 @@ fn parse(src: str): (list.List<Entry>, bool) with (a: mem.Allocator) {
                 bad_line = true
             } else {
                 var e: Entry
-                e.module = text.copy_str(words.get(1))
-                e.version = text.copy_str(words.get(2))
-                e.source = text.copy_str(words.get(3))
-                e.location = text.copy_str(words.get(4))
-                e.hash = text.copy_str(words.get(5))
+                e.module = fs.copy_str(words.get(1))
+                e.version = fs.copy_str(words.get(2))
+                e.source = fs.copy_str(words.get(3))
+                e.location = fs.copy_str(words.get(4))
+                e.hash = fs.copy_str(words.get(5))
                 xs.push(e)
             }
         } else {

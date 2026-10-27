@@ -3,10 +3,11 @@
 // gray means the module is on the stack, and the emitted order is
 // dependencies first.
 //
-// "Same folder" is the normalized absolute path, compared
-// case-insensitively. std.c does not bind GetCurrentDirectoryA.
+// "Same folder" is the normalized absolute path. Windows compares it
+// case-insensitively. Linux and macOS compare the bytes. The current
+// directory comes from fs.cwd.
 
-import std.c
+import std.error as errors
 import std.fs
 import std.io
 import std.list
@@ -15,12 +16,10 @@ import std.mem
 import std.strbuilder
 
 import src.cache
+import src.fail
+import src.host
 import src.manifest
-import src.text
-
-private extern {
-    fn GetCurrentDirectoryA(cap: c.unsigned_long, buffer: *c.char): c.unsigned_long
-}
+import std.text
 
 enum Source {
     Path
@@ -87,7 +86,7 @@ fn missing_cache_message(name: str, spec: str): str with (a: mem.Allocator) {
     b.append("' ")
     b.append(spec)
     b.append(" is not in the cache; fetching is not available yet; require it by the path of its .jogz")
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }
@@ -116,7 +115,13 @@ fn same_folder(a: str, b: str): bool {
     }
     var i: usize = 0
     for i < a.len {
-        if fold(a.ptr[i]) != fold(b.ptr[i]) {
+        var left = a.ptr[i]
+        var right = b.ptr[i]
+        if host.fold_case() {
+            left = fold(left)
+            right = fold(right)
+        }
+        if left != right {
             return false
         }
         i = i + 1
@@ -140,7 +145,7 @@ fn normalize(path: str): str with (a: mem.Allocator) {
     var abs = false
     var i: usize = 0
     if path.len >= 2 && path.ptr[1] == ':' as u8 && is_letter(path.ptr[0]) {
-        drive = text.view_range(path, 0, 2)
+        drive = text.slice(path, 0, 2)
         abs = true
         i = 2
         if i < path.len && is_sep(path.ptr[i]) {
@@ -162,7 +167,7 @@ fn normalize(path: str): str with (a: mem.Allocator) {
             }
             i = i + 1
         }
-        val seg = text.view_range(path, start, i)
+        val seg = text.slice(path, start, i)
         if seg == "." || seg.len == 0 {
             continue
         }
@@ -192,7 +197,7 @@ fn normalize(path: str): str with (a: mem.Allocator) {
         n = n + 1
     }
     segs.free()
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }
@@ -203,20 +208,16 @@ fn absolute(base_dir: str, spec: str): str with (a: mem.Allocator) {
     }
     val joined = fs.join(base_dir, spec)
     val norm = normalize(joined)
-    text.free_str(joined)
+    fs.free_str(joined)
     return norm
 }
 
-private fn cwd(): (str, bool) with (a: mem.Allocator) {
-    var buf: [4096]u8
-    val n = GetCurrentDirectoryA(4096, buf[..].ptr as *c.char)
-    if n == 0 || n >= 4096 {
-        return "", false
+private fn cwd(): (str, error?) with (a: mem.Allocator) {
+    var (dir, ok) = fs.cwd()
+    if !ok {
+        return "", errors.ErrIO
     }
-    var view = bytes()
-    view.ptr = buf[..].ptr
-    view.len = n as usize
-    return text.copy_str(view as str), true
+    return dir, null
 }
 
 private fn parent_dir(path: str): (str, bool) with (a: mem.Allocator) {
@@ -239,34 +240,39 @@ private fn parent_dir(path: str): (str, bool) with (a: mem.Allocator) {
         return "", false
     }
     if slash == 2 && path.len >= 2 && path.ptr[1] == ':' as u8 {
-        return text.copy_str(text.view_range(path, 0, 3)), true
+        return fs.copy_str(text.slice(path, 0, 3)), true
     }
     if slash == 0 {
-        return text.copy_str("/"), true
+        return fs.copy_str("/"), true
     }
-    return text.copy_str(text.view_range(path, 0, slash as usize)), true
+    return fs.copy_str(text.slice(path, 0, slash as usize)), true
 }
 
-fn module_root(): (str, bool) with (a: mem.Allocator) {
-    var (dir, ok) = cwd()
-    if !ok {
-        return "", false
+/**
+ * Walk from the current directory up to the first jog.mod.
+ * @context a allocator for the directory path
+ * @return that directory, or ErrNotFound when none exists
+ */
+fn module_root(): (str, error?) with (a: mem.Allocator) {
+    var (dir, cerr) = cwd()
+    if cerr != null {
+        return "", cerr
     }
     val norm = normalize(dir)
-    text.free_str(dir)
+    fs.free_str(dir)
     var current = norm
     for {
         val man = fs.join(current, "jog.mod")
-        var (data, found) = fs.read_all(man)
-        text.free_str(man)
-        if found {
+        var (data, err) = fs.read_all(man)
+        fs.free_str(man)
+        if err == null {
             a.free(data)
-            return current, true
+            return current, null
         }
         var (up, pok) = parent_dir(current)
-        text.free_str(current)
+        fs.free_str(current)
         if !pok {
-            return "", false
+            return "", errors.ErrNotFound
         }
         current = up
     }
@@ -294,9 +300,9 @@ private fn print_at(path: str, line: i64, col: i64, message: str) with (a: mem.A
 private fn read_mod(dir: str): (manifest.Manifest, str, i32) with (a: mem.Allocator) {
     var blank: manifest.Manifest
     val path = manifest_path(dir)
-    var (data, ok) = fs.read_all(path)
-    if !ok {
-        text.free_str(path)
+    var (data, read_err) = fs.read_all(path)
+    if read_err != null {
+        fs.free_str(path)
         return blank, "", 1
     }
     val text_bytes: str = data
@@ -304,7 +310,7 @@ private fn read_mod(dir: str): (manifest.Manifest, str, i32) with (a: mem.Alloca
     a.free(data)
     if !pok {
         print_at(path, err.pos.line, err.pos.col, err.message)
-        text.free_str(path)
+        fs.free_str(path)
         return blank, "", 2
     }
     return m, path, 0
@@ -314,11 +320,11 @@ private fn copy_chain(chain: list.List<str>, extra: str): list.List<str> with (a
     var out: list.List<str>
     var i: usize = 0
     for i < chain.len {
-        out.push(text.copy_str(chain.get(i)))
+        out.push(fs.copy_str(chain.get(i)))
         i = i + 1
     }
     if extra.len > 0 {
-        out.push(text.copy_str(extra))
+        out.push(fs.copy_str(extra))
     }
     return out
 }
@@ -409,7 +415,7 @@ private fn cycle_message(parent: list.List<str>, repeated: str): str with (a: me
         b.append(" -> ")
     }
     b.append(repeated)
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }
@@ -423,7 +429,7 @@ private fn conflict_message(name: str, first: list.List<str>, first_ver: manifes
     b.append("\n  ")
     append_chain(&b, second, second_ver, second_kind, second_spec)
     b.append("\na build has one version of each module")
-    val out = text.copy_str(b.str())
+    val out = fs.copy_str(b.str())
     b.free()
     return out
 }
@@ -436,7 +442,7 @@ private fn jog_message(man: manifest.Manifest, have: manifest.Version): str with
     manifest.append_version(&b, man.jog)
     b.append(" or later; this is jog ")
     manifest.append_version(&b, have)
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }
@@ -505,7 +511,7 @@ private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str
         b.append("'")
         print_at(path, man.name_line, man.name_col, b.str())
         b.free()
-        text.free_str(path)
+        fs.free_str(path)
         return false
     }
     if !man.library {
@@ -515,27 +521,27 @@ private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str
         b.append("' is not a library; only a module with 'kind library' can be required")
         print_at(path, man.name_line, man.name_col, b.str())
         b.free()
-        text.free_str(path)
+        fs.free_str(path)
         return false
     }
     if man.has_jog && !manifest.accepts(man.jog, self.jog_version) {
         val msg = jog_message(man, self.jog_version)
         print_at(path, man.jog_line, man.jog_col, msg)
-        text.free_str(msg)
-        text.free_str(path)
+        fs.free_str(msg)
+        fs.free_str(path)
         return false
     }
-    text.free_str(path)
+    fs.free_str(path)
     var w: Work
-    w.name = text.copy_str(req.module)
-    w.dir = text.copy_str(dir)
-    w.spec = text.copy_str(req.spec)
+    w.name = fs.copy_str(req.module)
+    w.dir = fs.copy_str(dir)
+    w.spec = fs.copy_str(req.spec)
     w.version = manifest.copy_version(man.version)
     w.man = man
     w.chain = chain
     w.color = color_gray
     w.source = source
-    w.hash = text.copy_str(file_hash)
+    w.hash = fs.copy_str(file_hash)
     w.has_version = man.has_version
     val idx = self.works.len
     self.works.push(w)
@@ -558,15 +564,15 @@ private fn *Walk.consider(req: manifest.Require, dir: str, parent: list.List<str
         if w.color == color_gray {
             val msg = cycle_message(parent, req.module)
             io.eprintln(msg)
-            text.free_str(msg)
+            fs.free_str(msg)
             return false
         }
         if same_folder(w.dir, dir) {
             if spec_before(req.spec, w.spec) {
                 var updated = self.works.get(existing)
                 val old_spec = updated.spec
-                updated.spec = text.copy_str(req.spec)
-                text.free_str(old_spec)
+                updated.spec = fs.copy_str(req.spec)
+                fs.free_str(old_spec)
                 self.works.set(existing, updated)
             }
             return true
@@ -588,14 +594,14 @@ private fn *Walk.consider(req: manifest.Require, dir: str, parent: list.List<str
             b.append("'")
             print_at(path, other.name_line, other.name_col, b.str())
             b.free()
-            text.free_str(path)
+            fs.free_str(path)
             return false
         }
         val second = copy_chain(parent, req.module)
         val msg = conflict_message(req.module, w.chain, w.version, source_name(w.source), w.spec, second, other.version, source_name(source), req.spec)
         io.eprintln(msg)
-        text.free_str(msg)
-        text.free_str(path)
+        fs.free_str(msg)
+        fs.free_str(path)
         return false
     }
     if self.case_clash(req.module) {
@@ -609,14 +615,14 @@ private fn *Walk.visit_archive(req: manifest.Require, from_dir: str, parent: lis
     val jogz = absolute(from_dir, req.spec)
     val root = cache.dir()
     if root.len == 0 {
-        io.eprintln("jog-build: no cache directory; set JOG_CACHE or LOCALAPPDATA")
-        text.free_str(jogz)
+        io.eprintln("jog-build: no cache directory; set JOG_CACHE")
+        fs.free_str(jogz)
         return false
     }
     var (am, iok) = cache.install(root, jogz)
-    text.free_str(jogz)
-    if !iok {
-        text.free_str(root)
+    fs.free_str(jogz)
+    if iok != null {
+        fs.free_str(root)
         return false
     }
     if am.m.module != req.module {
@@ -629,18 +635,18 @@ private fn *Walk.visit_archive(req: manifest.Require, from_dir: str, parent: lis
         io.eprintln(b.str())
         b.free()
         cache.free_manifest(&am)
-        text.free_str(root)
+        fs.free_str(root)
         return false
     }
     val ver = manifest.version_text(am.m.version)
     val dir = cache.src_dir(root, am.m.module, ver)
-    val file_hash = text.copy_str(am.hash)
+    val file_hash = fs.copy_str(am.hash)
     cache.free_manifest(&am)
-    text.free_str(ver)
-    text.free_str(root)
+    fs.free_str(ver)
+    fs.free_str(root)
     val ok = self.consider(req, dir, parent, Source.Archive, file_hash)
-    text.free_str(dir)
-    text.free_str(file_hash)
+    fs.free_str(dir)
+    fs.free_str(file_hash)
     return ok
 }
 
@@ -653,25 +659,25 @@ private fn *Walk.visit_version(req: manifest.Require, parent: list.List<str>): b
     if !present {
         val msg = missing_cache_message(req.module, req.spec)
         io.eprintln(msg)
-        text.free_str(msg)
-        text.free_str(root)
+        fs.free_str(msg)
+        fs.free_str(root)
         return false
     }
     var (am, sok) = cache.stored(root, req.module, req.spec)
-    if !sok {
+    if sok != null {
         io.eprint("jog-build: cannot read the cached manifest for '")
         io.eprint(req.module)
         io.eprintln("'")
-        text.free_str(root)
+        fs.free_str(root)
         return false
     }
     val dir = cache.src_dir(root, req.module, req.spec)
-    val file_hash = text.copy_str(am.hash)
+    val file_hash = fs.copy_str(am.hash)
     cache.free_manifest(&am)
-    text.free_str(root)
+    fs.free_str(root)
     val ok = self.consider(req, dir, parent, Source.Cache, file_hash)
-    text.free_str(dir)
-    text.free_str(file_hash)
+    fs.free_str(dir)
+    fs.free_str(file_hash)
     return ok
 }
 
@@ -684,7 +690,7 @@ private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<s
     }
     val dir = absolute(from_dir, req.spec)
     val ok = self.consider(req, dir, parent, Source.Path, "")
-    text.free_str(dir)
+    fs.free_str(dir)
     return ok
 }
 
@@ -701,55 +707,62 @@ private fn *Walk.walk_requires(dir: str, man: manifest.Manifest, chain: list.Lis
 
 private fn node_from(w: Work): Node with (a: mem.Allocator) {
     var n: Node
-    n.name = text.copy_str(w.name)
+    n.name = fs.copy_str(w.name)
     n.version = manifest.copy_version(w.version)
     n.source = w.source
-    n.spec = text.copy_str(w.spec)
-    n.dir = text.copy_str(w.dir)
-    n.hash = text.copy_str(w.hash)
+    n.spec = fs.copy_str(w.spec)
+    n.dir = fs.copy_str(w.dir)
+    n.hash = fs.copy_str(w.hash)
     n.has_version = w.has_version
     var i: usize = 0
     for i < w.man.requires.len {
-        n.requires.push(text.copy_str(w.man.requires.get(i).module))
+        n.requires.push(fs.copy_str(w.man.requires.get(i).module))
         i = i + 1
     }
     i = 0
     for i < w.chain.len {
-        n.chain.push(text.copy_str(w.chain.get(i)))
+        n.chain.push(fs.copy_str(w.chain.get(i)))
         i = i + 1
     }
     return n
 }
 
-fn resolve(root_dir: str, jog_version: manifest.Version): (Graph, bool) with (a: mem.Allocator) {
+/**
+ * Build the dependency graph. A failure is already printed.
+ * @param root_dir module root, relative or absolute
+ * @param jog_version compiler version from version
+ * @context a allocator for the graph
+ * @return the graph, or ErrReported
+ */
+fn resolve(root_dir: str, jog_version: manifest.Version): (Graph, error?) with (a: mem.Allocator) {
     var g: Graph
     val root = prepare_root(root_dir)
     g.root_dir = root
     var (man, path, status) = read_mod(root)
     if status == 1 {
         io.eprintln("jog-build: cannot find jog.mod")
-        return g, false
+        return g, fail.ErrReported
     }
     if status != 0 {
-        return g, false
+        return g, fail.ErrReported
     }
-    text.free_str(path)
+    fs.free_str(path)
     if man.has_jog && !manifest.accepts(man.jog, jog_version) {
         val msg = jog_message(man, jog_version)
         val again = manifest_path(root)
         print_at(again, man.jog_line, man.jog_col, msg)
-        text.free_str(msg)
-        text.free_str(again)
-        return g, false
+        fs.free_str(msg)
+        fs.free_str(again)
+        return g, fail.ErrReported
     }
     g.root = man
     var walk: Walk
     walk.root_name = man.module
     walk.jog_version = jog_version
     var chain: list.List<str>
-    chain.push(text.copy_str(man.module))
+    chain.push(fs.copy_str(man.module))
     if !walk.walk_requires(root, man, chain) {
-        return g, false
+        return g, fail.ErrReported
     }
     var i: usize = 0
     for i < walk.order.len {
@@ -757,7 +770,7 @@ fn resolve(root_dir: str, jog_version: manifest.Version): (Graph, bool) with (a:
         g.nodes.push(node_from(walk.works.get(idx)))
         i = i + 1
     }
-    return g, true
+    return g, null
 }
 
 // Relative roots are joined to the current directory. The result is normalized.
@@ -765,40 +778,40 @@ private fn prepare_root(root_dir: str): str with (a: mem.Allocator) {
     if is_absolute(root_dir) {
         return normalize(root_dir)
     }
-    var (c, ok) = cwd()
-    if !ok {
+    var (c, err) = cwd()
+    if err != null {
         return normalize(root_dir)
     }
     val joined = fs.join(c, root_dir)
-    text.free_str(c)
+    fs.free_str(c)
     val norm = normalize(joined)
-    text.free_str(joined)
+    fs.free_str(joined)
     return norm
 }
 
 fn free(g: *Graph) with (a: mem.Allocator) {
     manifest.free(&g.root)
-    text.free_str(g.root_dir)
+    fs.free_str(g.root_dir)
     var i: usize = 0
     for i < g.nodes.len {
         var n = g.nodes.get(i)
-        text.free_str(n.name)
-        text.free_str(n.spec)
-        text.free_str(n.dir)
-        text.free_str(n.hash)
-        text.free_str(n.version.major)
-        text.free_str(n.version.minor)
-        text.free_str(n.version.patch)
-        text.free_str(n.version.pre)
+        fs.free_str(n.name)
+        fs.free_str(n.spec)
+        fs.free_str(n.dir)
+        fs.free_str(n.hash)
+        fs.free_str(n.version.major)
+        fs.free_str(n.version.minor)
+        fs.free_str(n.version.patch)
+        fs.free_str(n.version.pre)
         var k: usize = 0
         for k < n.requires.len {
-            text.free_str(n.requires.get(k))
+            fs.free_str(n.requires.get(k))
             k = k + 1
         }
         n.requires.free()
         k = 0
         for k < n.chain.len {
-            text.free_str(n.chain.get(k))
+            fs.free_str(n.chain.get(k))
             k = k + 1
         }
         n.chain.free()

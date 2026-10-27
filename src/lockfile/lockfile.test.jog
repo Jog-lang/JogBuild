@@ -2,12 +2,12 @@
 // notes/Packages.md, "jog.lock", whatever order the entries are given.
 
 import std.arena
-import std.c
 import std.fs
 import std.list
 import std.testing
 
-import src.text
+import src.host
+
 
 private fn entry(module: str, version: str, source: str, location: str, hash: str): Entry {
     var e: Entry
@@ -59,21 +59,16 @@ fn write_skips_identical_bytes() with (t: testing.Testing) {
     var ar = arena.init(0)
     with (&ar) {
         val dir = fs.join("out", "lock-test")
-        if dir.len > 0 && dir.len < 4096 {
-            var wide: [4096]u16
-            if c.utf8_to_wide(dir, wide[..].ptr, 4096) {
-                c.CreateDirectoryW(wide[..].ptr, 0)
-            }
-        }
+        host.mkdir(dir)
         val path = fs.join(dir, "jog.lock")
         val body = "# jog.lock: written by jog-build, do not edit\nlock 1\n"
-        t.expect(write_if_changed(path, body))
-        t.expect(write_if_changed(path, body))
-        var (data, ok) = fs.read_all(path)
-        t.expect(ok)
+        t.expect(write_if_changed(path, body) == null)
+        t.expect(write_if_changed(path, body) == null)
+        var (data, err) = fs.read_all(path)
+        t.expect(err == null)
         val got: str = data
         t.expectEq(got, body)
-        text.free_str(path)
+        fs.free_str(path)
         fs.free_str(dir)
     }
     ar.release()

@@ -3,10 +3,11 @@
 // order. The root folder is the package argument: proc.run has no
 // working directory.
 //
-// proc.run waits and captures both streams. run_jog prints stdout, then
-// stderr, and returns the child's code. See Friction.md, "proc.run waits".
+// proc.run waits and captures both streams. A failed start is an error.
+// run_jog prints stdout, then stderr, and returns the child's code,
+// including a non-zero exit. See Friction.md, "proc.run waits".
 
-import std.c
+import std.error as errors
 import std.fs
 import std.io
 import std.list
@@ -14,62 +15,74 @@ import std.mem
 import std.os
 import std.proc
 import std.strbuilder
+import std.text
 
+import src.fail
+import src.host
 import src.manifest
 import src.resolve
-import src.text
 
-// std.c does not bind this. 0xFFFFFFFF means the path is missing.
-private extern {
-    fn GetFileAttributesA(name: *const c.char): c.unsigned_long
-}
-
-private fn file_exists(path: str): bool {
-    if path.len == 0 || path.len >= 4096 {
-        return false
-    }
-    var buf: [4096]u8
-    c.memcpy(buf[..].ptr as *void, path.ptr as *const void, path.len)
-    *(buf[..].ptr + path.len) = 0
-    val attr = GetFileAttributesA(buf[..].ptr as *const c.char)
-    if attr == 0xFFFFFFFF as c.unsigned_long {
-        return false
-    }
-    val directory: c.unsigned_long = 0x10
-    return (attr & directory) == 0
-}
-
-fn find(): (str, bool) with (a: mem.Allocator) {
-    var (jog_env, jok) = os.env("JOG")
-    if jok && jog_env.len > 0 {
-        return text.copy_str(jog_env), true
-    }
-    var (path_env, pok) = os.env("PATH")
-    if !pok || path_env.len == 0 {
-        return "", false
-    }
-    val path = text.copy_str(path_env)
-    var parts = text.split(path, ';' as u8)
-    var found: str = ""
+/**
+ * Split src on one byte. The pieces are views into src, including an
+ * empty piece when the separator is at either end. Only the list buffer
+ * is allocated.
+ * @param src PATH text, not copied
+ * @param sep separator byte
+ * @context a allocator for the list buffer
+ * @return the pieces
+ */
+private fn split(src: str, sep: u8): list.List<str> with (a: mem.Allocator) {
+    var parts: list.List<str>
+    var start: usize = 0
     var i: usize = 0
-    for i < parts.len {
-        val dir = parts.get(i)
-        if dir.len > 0 && found.len == 0 {
-            val candidate = fs.join(dir, "jog.exe")
-            if file_exists(candidate) {
-                found = candidate
-            } else {
-                text.free_str(candidate)
-            }
+    for i < src.len {
+        if src.ptr[i] == sep {
+            parts.push(text.slice(src, start, i))
+            start = i + 1
         }
         i = i + 1
     }
-    parts.free()
-    text.free_str(path)
-    if found.len == 0 {
-        return "", false
+    parts.push(text.slice(src, start, src.len))
+    return parts
+}
+
+/**
+ * The compiler executable. JOG wins when it is set, without checking
+ * that the file is there. Otherwise the first jog on PATH. The file
+ * name and the PATH separator come from src.host.
+ * fs.exists is true for a directory of that name too. version then
+ * returns the process error.
+ * @context a allocator for the path
+ * @return the path, or ErrNotFound when PATH has no match
+ */
+fn find(): (str, error?) with (a: mem.Allocator) {
+    var (jog_env, jok) = os.env("JOG")
+    if jok && jog_env.len > 0 {
+        return fs.copy_str(jog_env), null
     }
-    return found, true
+    var (path_env, pok) = os.env("PATH")
+    if !pok || path_env.len == 0 {
+        return "", errors.ErrNotFound
+    }
+    val path = fs.copy_str(path_env)
+    defer fs.free_str(path)
+    var parts = split(path, host.path_sep())
+    defer parts.free()
+    var found: str = ""
+    for dir in parts.items() {
+        if dir.len > 0 && found.len == 0 {
+            val candidate = fs.join(dir, host.compiler_file())
+            if fs.exists(candidate) {
+                found = candidate
+            } else {
+                fs.free_str(candidate)
+            }
+        }
+    }
+    if found.len == 0 {
+        return "", errors.ErrNotFound
+    }
+    return found, null
 }
 
 fn module_arg(name: str, dir: str): str with (a: mem.Allocator) {
@@ -77,7 +90,7 @@ fn module_arg(name: str, dir: str): str with (a: mem.Allocator) {
     b.append(name)
     b.append("=")
     b.append(dir)
-    val text = text.copy_str(b.str())
+    val text = fs.copy_str(b.str())
     b.free()
     return text
 }
@@ -114,9 +127,9 @@ fn command(jog: str, sub: str, root: str, flags: []str, extra: []str): list.List
 }
 
 fn run_jog(args: []str): i32 with (a: mem.Allocator) {
-    val out = proc.run(args)
-    if !out.ok {
-        proc.free_output(out)
+    var (out, err) = proc.run(args)
+    defer proc.free_output(out)
+    if err != null {
         io.eprintln("jog-build: cannot run the compiler")
         return 1
     }
@@ -124,9 +137,7 @@ fn run_jog(args: []str): i32 with (a: mem.Allocator) {
     val err_text: str = out.stderr
     io.print(out_text)
     io.eprint(err_text)
-    val code = out.code
-    proc.free_output(out)
-    return code
+    return out.code
 }
 
 private fn version_word(src: str): str {
@@ -160,28 +171,31 @@ private fn version_word(src: str): str {
         }
         i = i + 1
     }
-    return text.view_range(src, start, i)
+    return text.slice(src, start, i)
 }
 
-fn version(jog: str): (manifest.Version, bool) with (a: mem.Allocator) {
+/**
+ * Run `jog version` and parse MAJOR.MINOR.PATCH.
+ * @param jog compiler path from find
+ * @context a allocator for the version strings
+ * @return the version, the process error, or ErrReported when the word is not a version
+ */
+fn version(jog: str): (manifest.Version, error?) with (a: mem.Allocator) {
     var args: list.List<str>
+    defer args.free()
     args.push(jog)
     args.push("version")
-    val out = proc.run(args.slice_view())
-    args.free()
+    var (out, err) = proc.run(args.items())
+    defer proc.free_output(out)
     var blank: manifest.Version
-    if !out.ok {
-        proc.free_output(out)
-        return blank, false
+    if err != null {
+        return blank, err
     }
-    val text: str = out.stdout
-    val word = version_word(text)
+    val stdout_text: str = out.stdout
+    val word = version_word(stdout_text)
     var (v, ok) = manifest.parse_version(word)
     if !ok {
-        proc.free_output(out)
-        return blank, false
+        return blank, fail.ErrReported
     }
-    val owned = manifest.copy_version(v)
-    proc.free_output(out)
-    return owned, true
+    return manifest.copy_version(v), null
 }

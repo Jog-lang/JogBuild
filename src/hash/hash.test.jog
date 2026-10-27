@@ -217,8 +217,8 @@ private fn collect(dir: str, prefix: str, files: *list.List<File>) with (t: test
         } else if is_lib_test(rel) {
             free_text(rel)
         } else {
-            val (data, read_ok) = fs.read_all(child)
-            if !read_ok {
+            val (data, err) = fs.read_all(child)
+            if err != null {
                 io.eprint("cannot read ")
                 io.eprint(child)
                 io.eprint("\n")
@@ -304,10 +304,10 @@ fn contentHashLib() with (t: testing.Testing) {
         val got_hash = content_hash(files.slice_view())
         val lines_path = fs.join(root, "testdata/hash/lib.lines")
         val hash_path = fs.join(root, "testdata/hash/lib.hash")
-        val (want_lines_bytes, lines_ok) = fs.read_all(lines_path)
-        val (want_hash_bytes, hash_ok) = fs.read_all(hash_path)
-        t.expect(lines_ok)
-        t.expect(hash_ok)
+        val (want_lines_bytes, lines_err) = fs.read_all(lines_path)
+        val (want_hash_bytes, hash_err) = fs.read_all(hash_path)
+        t.expect(lines_err == null)
+        t.expect(hash_err == null)
         val want_lines: str = want_lines_bytes
         val want_hash = trim_nl(want_hash_bytes)
         expect_text("lines", lines, want_lines)
