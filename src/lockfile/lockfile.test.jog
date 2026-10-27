@@ -1,0 +1,80 @@
+// Package src.lockfile. The formatted file matches the example in
+// notes/Packages.md, "jog.lock", whatever order the entries are given.
+
+import std.arena
+import std.c
+import std.fs
+import std.list
+import std.testing
+
+import src.text
+
+private fn entry(module: str, version: str, source: str, location: str, hash: str): Entry {
+    var e: Entry
+    e.module = module
+    e.version = version
+    e.source = source
+    e.location = location
+    e.hash = hash
+    return e
+}
+
+@test
+fn format_sorts_like_the_spec() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var xs: list.List<Entry>
+        xs.push(entry("sdl", "0.2.1", "path", "../sdl", "-"))
+        xs.push(entry("json", "1.4.0", "cache", "-", "sha256:0c6f1e..."))
+        xs.push(entry("mathx", "1.2.0", "archive", "../vendor/mathx-1.2.0.jogz", "sha256:9f2c44..."))
+        val got = format(xs.slice_view())
+        val want = "# jog.lock: written by jog-build, do not edit\nlock 1\ndep json 1.4.0 cache - sha256:0c6f1e...\ndep mathx 1.2.0 archive ../vendor/mathx-1.2.0.jogz sha256:9f2c44...\ndep sdl 0.2.1 path ../sdl -\n"
+        t.expectEq(got, want)
+        var again: list.List<Entry>
+        again.push(xs.get(2))
+        again.push(xs.get(0))
+        again.push(xs.get(1))
+        val got2 = format(again.slice_view())
+        t.expectEq(got2, want)
+        var (parsed, ok) = parse(got)
+        t.expect(ok)
+        t.expect(parsed.len == 3)
+        if parsed.len == 3 {
+            t.expect(parsed.get(0).module == "json")
+            t.expect(parsed.get(0).source == "cache")
+            t.expect(parsed.get(0).location == "-")
+            t.expect(parsed.get(1).source == "archive")
+            t.expect(parsed.get(1).location == "../vendor/mathx-1.2.0.jogz")
+            t.expect(parsed.get(2).module == "sdl")
+            t.expect(parsed.get(2).hash == "-")
+        }
+        val slashed = slash_spec("..\\vendor\\mathx-1.2.0.jogz")
+        t.expectEq(slashed, "../vendor/mathx-1.2.0.jogz")
+    }
+    ar.release()
+}
+
+@test
+fn write_skips_identical_bytes() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val dir = fs.join("out", "lock-test")
+        if dir.len > 0 && dir.len < 4096 {
+            var wide: [4096]u16
+            if c.utf8_to_wide(dir, wide[..].ptr, 4096) {
+                c.CreateDirectoryW(wide[..].ptr, 0)
+            }
+        }
+        val path = fs.join(dir, "jog.lock")
+        val body = "# jog.lock: written by jog-build, do not edit\nlock 1\n"
+        t.expect(write_if_changed(path, body))
+        t.expect(write_if_changed(path, body))
+        var (data, ok) = fs.read_all(path)
+        t.expect(ok)
+        val got: str = data
+        t.expectEq(got, body)
+        text.free_str(path)
+        fs.free_str(dir)
+    }
+    ar.release()
+}

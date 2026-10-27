@@ -22,7 +22,7 @@
 // free_text releases that message. On success the message is "".
 //
 // CRC-32: reflected polynomial 0xEDB88320, register starts at 0xFFFFFFFF,
-// result complemented. crc32("123456789") is 0xCBF43926. CTools
+// result complemented. crc32("123456789") is 0xCBF43926. JogCompiler
 // tests/jog/crc.jog builds the table with @comptime. This table is built
 // at startup. crc32_update continues a finished CRC: crc32_update(crc32(x), y)
 // is crc32 of x followed by y, and crc32_update(0, data) is crc32(data).
@@ -39,7 +39,7 @@ struct Entry {
 }
 
 // Copies text. An empty str allocates nothing.
-private fn copy_text(text: str): str with (a: mem.Allocator) {
+fn copy_text(text: str): str with (a: mem.Allocator) {
     if text.len == 0 {
         return ""
     }
@@ -144,7 +144,7 @@ fn check_name(name: str): bool {
     return segment_ok(name, start, name.len)
 }
 
-private fn same_text(left: str, right: str): bool {
+fn same_text(left: str, right: str): bool {
     if left.len != right.len {
         return false
     }
@@ -168,13 +168,13 @@ private fn put_u32(p: *u8, at: usize, v: u32) {
     put_u16(p, at + 2, v >> 16)
 }
 
-private fn u16_at(data: bytes, at: usize): u32 {
+fn u16_at(data: bytes, at: usize): u32 {
     val b0 = data.ptr[at] as u32
     val b1 = data.ptr[at + 1] as u32
     return b0 | (b1 << 8)
 }
 
-private fn u32_at(data: bytes, at: usize): u32 {
+fn u32_at(data: bytes, at: usize): u32 {
     val lo = u16_at(data, at)
     val hi = u16_at(data, at + 2)
     return lo | (hi << 16)

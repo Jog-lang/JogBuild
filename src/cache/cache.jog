@@ -12,44 +12,668 @@
 // that already exists with a different hash in its manifest is an error.
 // Milestone 9 of notes/Plan.md.
 //
-// std has no mkdir, rename, or delete-folder call. std.c binds
-// CreateDirectoryA, RemoveDirectoryA, and DeleteFileA; MoveFileExA is not
-// bound, so this package declares it in a private extern block, the way
-// JogLSP's serve.jog declares _setmode. See Plan.md, milestone 9.
-//
-// Comments only, except dir.
-//
-// Sketch:
-//
-// struct ArchiveManifest {         the "manifest" entry of a .jogz
-//     archive: i64                 must be 1
-//     m: manifest.Manifest         module, version, kind, jog, require, export
-//     hash: str                    sha256:<hex>
-// }
-//
-// Signatures:
-//
-// fn module_dir(root: str, name: str, version: str): str with (a: mem.Allocator)
-//     <root>/mod/<name>/<version>
-// fn src_dir(root: str, name: str, version: str): str with (a: mem.Allocator)
-//     <root>/mod/<name>/<version>/src, the --module <dir>
-// fn has(root: str, name: str, version: str): bool with (a: mem.Allocator)
-// fn read_archive_manifest(text: str): (ArchiveManifest, bool) with (a: mem.Allocator)
-// fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allocator)
-//     zip.read, check names, CRCs, and the content hash, write under
-//     tmp/<unique>, rename to mod/<name>/<version>. A second install of
-//     the same archive is a no-op after comparing hashes.
+// Every function takes the cache root as a parameter. Only dir reads
+// the environment. MoveFileExA is not in std.c, so it is declared here
+// (CTools Friction.md). Flags are 0, so a rename fails when the target
+// exists.
 
+import std.c
 import std.fs
+import std.io
+import std.list
 import std.mem
 import std.os
+import std.strbuilder
 
 import src.hash
 import src.manifest
+import src.text
 import src.zip
 
+private extern {
+    fn MoveFileExA(existing: *const c.char, dest: *const c.char, flags: c.unsigned_long): c.int
+}
+
+struct ArchiveManifest {
+    archive: i64
+    m: manifest.Manifest
+    hash: str
+}
+
+fn free_manifest(am: *ArchiveManifest) with (a: mem.Allocator) {
+    manifest.free(&am.m)
+    text.free_str(am.hash)
+    am.hash = ""
+    am.archive = 0
+}
+
 // The cache root. JOG_CACHE wins when it is set and non-empty. The result
-// is a new block from the Allocator.
+// is a new block from the Allocator. Empty means neither variable is set.
 fn dir(): str with (a: mem.Allocator) {
-    panic("not implemented: cache.dir")
+    var (cache_env, ok) = os.env("JOG_CACHE")
+    if ok && cache_env.len > 0 {
+        return text.copy_str(cache_env)
+    }
+    var (local, lok) = os.env("LOCALAPPDATA")
+    if !lok || local.len == 0 {
+        return ""
+    }
+    val local_copy = text.copy_str(local)
+    val jog = fs.join(local_copy, "jog")
+    val root = fs.join(jog, "cache")
+    text.free_str(local_copy)
+    fs.free_str(jog)
+    return root
+}
+
+fn module_dir(root: str, name: str, version: str): str with (a: mem.Allocator) {
+    val mods = fs.join(root, "mod")
+    val named = fs.join(mods, name)
+    val dir = fs.join(named, version)
+    fs.free_str(mods)
+    fs.free_str(named)
+    return dir
+}
+
+fn src_dir(root: str, name: str, version: str): str with (a: mem.Allocator) {
+    val base = module_dir(root, name, version)
+    val src = fs.join(base, "src")
+    fs.free_str(base)
+    return src
+}
+
+fn has(root: str, name: str, version: str): bool with (a: mem.Allocator) {
+    val base = module_dir(root, name, version)
+    val path = fs.join(base, "manifest")
+    fs.free_str(base)
+    var (data, ok) = fs.read_all(path)
+    fs.free_str(path)
+    if ok && data.len > 0 {
+        a.free(data)
+    }
+    return ok
+}
+
+private fn line_words(line: str): list.List<str> with (a: mem.Allocator) {
+    var words: list.List<str>
+    var i: usize = 0
+    for i < line.len {
+        val c = line.ptr[i]
+        if c == ' ' as u8 || c == '\t' as u8 {
+            i = i + 1
+            continue
+        }
+        if c == '#' as u8 {
+            break
+        }
+        val start = i
+        for i < line.len {
+            val d = line.ptr[i]
+            if d == ' ' as u8 || d == '\t' as u8 || d == '#' as u8 {
+                break
+            }
+            i = i + 1
+        }
+        words.push(text.view_range(line, start, i))
+    }
+    return words
+}
+
+private fn hash_ok(sum: str): bool {
+    if !text.starts_with(sum, "sha256:") || sum.len != 71 {
+        return false
+    }
+    var i: usize = 7
+    for i < sum.len {
+        val c = sum.ptr[i]
+        val digit = c >= '0' as u8 && c <= '9' as u8
+        val lower = c >= 'a' as u8 && c <= 'f' as u8
+        if !digit && !lower {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn read_archive_manifest(src: str): (ArchiveManifest, bool) with (a: mem.Allocator) {
+    var am: ArchiveManifest
+    var body = strbuilder.empty()
+    var saw_archive = false
+    var saw_hash = false
+    var failed = false
+    var at: usize = 0
+    for at < src.len {
+        if failed {
+            break
+        }
+        val start = at
+        for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
+            at = at + 1
+        }
+        val line = text.view_range(src, start, at)
+        if at < src.len && src.ptr[at] == '\r' as u8 {
+            at = at + 1
+        }
+        if at < src.len && src.ptr[at] == '\n' as u8 {
+            at = at + 1
+        }
+        var words = line_words(line)
+        if words.len == 0 {
+            body.append(line)
+            body.append("\n")
+            words.free()
+            continue
+        }
+        val first = words.get(0)
+        if first == "archive" {
+            if saw_archive || words.len != 2 || words.get(1) != "1" {
+                io.eprintln("jog-build: archive version is not 1")
+                failed = true
+            } else {
+                saw_archive = true
+                am.archive = 1
+            }
+        } else if first == "hash" {
+            if !saw_archive || saw_hash || words.len != 2 || !hash_ok(words.get(1)) {
+                io.eprintln("jog-build: invalid archive hash")
+                failed = true
+            } else {
+                saw_hash = true
+                am.hash = text.copy_str(words.get(1))
+            }
+        } else if !saw_archive {
+            io.eprintln("jog-build: archive manifest must start with 'archive 1'")
+            failed = true
+        } else {
+            body.append(line)
+            body.append("\n")
+        }
+        words.free()
+    }
+    if failed || !saw_archive || !saw_hash {
+        if !failed && !saw_archive {
+            io.eprintln("jog-build: archive manifest must start with 'archive 1'")
+        } else if !failed && !saw_hash {
+            io.eprintln("jog-build: archive manifest has no hash")
+        }
+        body.free()
+        text.free_str(am.hash)
+        var blank: ArchiveManifest
+        return blank, false
+    }
+    val body_text = text.copy_str(body.str())
+    body.free()
+    var (m, err, pok) = manifest.parse(body_text)
+    text.free_str(body_text)
+    if !pok {
+        io.eprintln(err.message)
+        text.free_str(am.hash)
+        var blank: ArchiveManifest
+        return blank, false
+    }
+    if !m.has_version || !m.library {
+        io.eprintln("jog-build: archive manifest needs a version and kind library")
+        manifest.free(&m)
+        text.free_str(am.hash)
+        var blank: ArchiveManifest
+        return blank, false
+    }
+    am.m = m
+    return am, true
+}
+
+fn stored(root: str, name: str, version: str): (ArchiveManifest, bool) with (a: mem.Allocator) {
+    var blank: ArchiveManifest
+    val base = module_dir(root, name, version)
+    val path = fs.join(base, "manifest")
+    fs.free_str(base)
+    var (data, ok) = fs.read_all(path)
+    fs.free_str(path)
+    if !ok {
+        return blank, false
+    }
+    val src: str = data
+    var (am, pok) = read_archive_manifest(src)
+    a.free(data)
+    if !pok {
+        return blank, false
+    }
+    return am, true
+}
+
+private fn ensure_dir(path: str) {
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.CreateDirectoryW(wide[..].ptr, 0)
+}
+
+private fn mkdir_one(path: str): bool {
+    if path.len == 0 || path.len >= 4096 {
+        return false
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return false
+    }
+    return c.CreateDirectoryW(wide[..].ptr, 0) != 0
+}
+
+private fn mkdir_all(path: str): bool with (a: mem.Allocator) {
+    if path.len == 0 || path.len >= 4096 {
+        return false
+    }
+    var i: usize = 0
+    if path.len >= 2 && path.ptr[1] == ':' as u8 {
+        i = 2
+    }
+    for i < path.len {
+        val c = path.ptr[i]
+        if (c == '/' as u8 || c == '\\' as u8) && i > 0 {
+            ensure_dir(text.view_range(path, 0, i))
+        }
+        i = i + 1
+    }
+    ensure_dir(path)
+    var (names, ok) = fs.list(path)
+    if ok {
+        fs.free_names(&names)
+    }
+    return ok
+}
+
+private fn parent_of(path: str): str {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            if i == 0 {
+                return text.view_range(path, 0, 1)
+            }
+            return text.view_range(path, 0, i)
+        }
+    }
+    return ""
+}
+
+private fn fill_path(path: str, dest: *u8): bool {
+    if path.len == 0 || path.len >= 4096 {
+        return false
+    }
+    c.memcpy(dest as *void, path.ptr as *const void, path.len)
+    *(dest + path.len) = 0
+    return true
+}
+
+private fn delete_file(path: str) {
+    var wide: [4096]u16
+    if path.len == 0 || !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.DeleteFileW(wide[..].ptr)
+}
+
+private fn remove_dir(path: str) {
+    var wide: [4096]u16
+    if path.len == 0 || !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.RemoveDirectoryW(wide[..].ptr)
+}
+
+private fn remove_tree(path: str) with (a: mem.Allocator) {
+    var (names, ok) = fs.list(path)
+    if !ok {
+        delete_file(path)
+        return
+    }
+    var i: usize = 0
+    for i < names.len {
+        val child = fs.join(path, names.get(i))
+        remove_tree(child)
+        fs.free_str(child)
+        i = i + 1
+    }
+    fs.free_names(&names)
+    remove_dir(path)
+}
+
+private fn move_dir(from: str, to: str): bool {
+    var from_buf: [4096]u8
+    var to_buf: [4096]u8
+    if !fill_path(from, from_buf[..].ptr) || !fill_path(to, to_buf[..].ptr) {
+        return false
+    }
+    val flags: c.unsigned_long = 0
+    return MoveFileExA(from_buf[..].ptr as *const c.char, to_buf[..].ptr as *const c.char, flags) != 0
+}
+
+private fn make_tmp(root: str, module: str, version: str): str with (a: mem.Allocator) {
+    val tmp_root = fs.join(root, "tmp")
+    if !mkdir_all(tmp_root) {
+        fs.free_str(tmp_root)
+        return ""
+    }
+    var n: i64 = 0
+    var chosen: str = ""
+    for n < 1000 {
+        var b = strbuilder.empty()
+        b.append(tmp_root)
+        b.append("/")
+        b.append(module)
+        b.append("-")
+        b.append(version)
+        b.append("-")
+        b.append_int(n, 10)
+        val candidate = text.copy_str(b.str())
+        b.free()
+        if mkdir_one(candidate) {
+            chosen = candidate
+            break
+        }
+        text.free_str(candidate)
+        n = n + 1
+    }
+    fs.free_str(tmp_root)
+    return chosen
+}
+
+private fn write_rel(root: str, rel: str, data: bytes): bool with (a: mem.Allocator) {
+    val full = fs.join(root, rel)
+    val parent = parent_of(full)
+    var made = true
+    if parent.len > 0 {
+        made = mkdir_all(parent)
+    }
+    var wrote = false
+    if made {
+        wrote = fs.write_all(full, data)
+    }
+    if !wrote {
+        io.eprint("jog-build: cannot write ")
+        io.eprintln(full)
+    }
+    fs.free_str(full)
+    return wrote
+}
+
+private fn name_before(left: str, right: str): bool {
+    var n = left.len
+    if right.len < n {
+        n = right.len
+    }
+    var i: usize = 0
+    for i < n {
+        val lb = left.ptr[i]
+        val rb = right.ptr[i]
+        if lb < rb {
+            return true
+        }
+        if rb < lb {
+            return false
+        }
+        i = i + 1
+    }
+    return left.len < right.len
+}
+
+private fn rel_join(prefix: str, name: str): str with (a: mem.Allocator) {
+    if prefix.len == 0 {
+        return text.copy_str(name)
+    }
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append("/")
+    b.append(name)
+    val out = text.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn free_files(files: *list.List<hash.File>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < files.len {
+        val f = files.get(i)
+        text.free_str(f.name)
+        if f.data.len > 0 {
+            a.free(f.data)
+        }
+        i = i + 1
+    }
+    files.free()
+}
+
+private fn collect_files(dir: str, prefix: str, files: *list.List<hash.File>): bool with (a: mem.Allocator) {
+    var (names, ok) = fs.list(dir)
+    if !ok {
+        return false
+    }
+    var i: usize = 0
+    var failed = false
+    for i < names.len {
+        if failed {
+            break
+        }
+        val name = names.get(i)
+        val child = fs.join(dir, name)
+        var (sub, is_dir) = fs.list(child)
+        if is_dir {
+            fs.free_names(&sub)
+            val rel = rel_join(prefix, name)
+            if !collect_files(child, rel, files) {
+                failed = true
+            }
+            text.free_str(rel)
+        } else {
+            var (data, rok) = fs.read_all(child)
+            if !rok {
+                failed = true
+            } else {
+                var f: hash.File
+                f.name = rel_join(prefix, name)
+                f.data = data
+                files.push(f)
+            }
+        }
+        fs.free_str(child)
+        i = i + 1
+    }
+    fs.free_names(&names)
+    return !failed
+}
+
+private fn sort_files(files: *list.List<hash.File>) {
+    var i: usize = 1
+    for i < files.len {
+        val key = files.get(i)
+        var j = i
+        for j > 0 {
+            if !name_before(key.name, files.get(j - 1).name) {
+                break
+            }
+            files.set(j, files.get(j - 1))
+            j = j - 1
+        }
+        files.set(j, key)
+        i = i + 1
+    }
+}
+
+private fn hash_dir(dir: str): (str, bool) with (a: mem.Allocator) {
+    var files: list.List<hash.File>
+    if !collect_files(dir, "", &files) {
+        free_files(&files)
+        return "", false
+    }
+    sort_files(&files)
+    val sum = hash.content_hash(files.slice_view())
+    free_files(&files)
+    return sum, true
+}
+
+private fn different_archives(name: str, version: str) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("two different archives claim to be '")
+    b.append(name)
+    b.append(" ")
+    b.append(version)
+    b.append("'")
+    io.eprintln(b.str())
+    b.free()
+}
+
+private fn release_zip(entries: list.List<zip.Entry>, data: bytes) with (a: mem.Allocator) {
+    var gone = entries
+    gone.free()
+    if data.len > 0 {
+        a.free(data)
+    }
+}
+
+private fn as_text(data: bytes): str {
+    var out = bytes()
+    out.ptr = data.ptr
+    out.len = data.len
+    return out
+}
+
+fn install(root: str, jogz_path: str): (ArchiveManifest, bool) with (a: mem.Allocator) {
+    var blank: ArchiveManifest
+    var (data, rok) = fs.read_all(jogz_path)
+    if !rok {
+        io.eprint("jog-build: cannot read archive '")
+        io.eprint(jogz_path)
+        io.eprintln("'")
+        return blank, false
+    }
+    var (entries, msg, zok) = zip.read(data)
+    if !zok {
+        io.eprint("archive '")
+        io.eprint(jogz_path)
+        io.eprint("': ")
+        io.eprintln(msg)
+        zip.free_text(msg)
+        release_zip(entries, data)
+        return blank, false
+    }
+    var saw_man = false
+    var man_data = bytes()
+    var i: usize = 0
+    for i < entries.len {
+        val e = entries.get(i)
+        if e.name == "manifest" {
+            saw_man = true
+            man_data = e.data
+        }
+        i = i + 1
+    }
+    if !saw_man {
+        io.eprint("jog-build: archive '")
+        io.eprint(jogz_path)
+        io.eprintln("' has no manifest entry")
+        release_zip(entries, data)
+        return blank, false
+    }
+    var (am, pok) = read_archive_manifest(as_text(man_data))
+    if !pok {
+        release_zip(entries, data)
+        return blank, false
+    }
+    val ver = manifest.version_text(am.m.version)
+    var (old, exists) = stored(root, am.m.module, ver)
+    if exists {
+        val same = old.hash == am.hash
+        if !same {
+            different_archives(am.m.module, ver)
+        }
+        free_manifest(&old)
+        text.free_str(ver)
+        release_zip(entries, data)
+        if same {
+            return am, true
+        }
+        free_manifest(&am)
+        return blank, false
+    }
+    val tmp = make_tmp(root, am.m.module, ver)
+    if tmp.len == 0 {
+        io.eprintln("jog-build: cannot create a cache temp directory")
+        text.free_str(ver)
+        release_zip(entries, data)
+        free_manifest(&am)
+        return blank, false
+    }
+    var wrote = write_rel(tmp, "manifest", man_data)
+    i = 0
+    for i < entries.len {
+        if !wrote {
+            break
+        }
+        val e = entries.get(i)
+        if text.starts_with(e.name, "src/") && e.name.len > 4 {
+            wrote = write_rel(tmp, e.name, e.data)
+        }
+        i = i + 1
+    }
+    release_zip(entries, data)
+    if !wrote {
+        remove_tree(tmp)
+        text.free_str(tmp)
+        text.free_str(ver)
+        free_manifest(&am)
+        return blank, false
+    }
+    val src = fs.join(tmp, "src")
+    var (got, hok) = hash_dir(src)
+    fs.free_str(src)
+    if !hok || got != am.hash {
+        io.eprintln("jog-build: content hash does not match the manifest")
+        text.free_str(got)
+        remove_tree(tmp)
+        text.free_str(tmp)
+        text.free_str(ver)
+        free_manifest(&am)
+        return blank, false
+    }
+    text.free_str(got)
+    val dest = module_dir(root, am.m.module, ver)
+    val parent = parent_of(dest)
+    val parent_ok = mkdir_all(parent)
+    var moved = false
+    if parent_ok {
+        moved = move_dir(tmp, dest)
+    }
+    if moved {
+        fs.free_str(dest)
+        text.free_str(tmp)
+        text.free_str(ver)
+        return am, true
+    }
+    var (raced, rok2) = stored(root, am.m.module, ver)
+    if rok2 && raced.hash == am.hash {
+        free_manifest(&raced)
+        remove_tree(tmp)
+        fs.free_str(dest)
+        text.free_str(tmp)
+        text.free_str(ver)
+        return am, true
+    }
+    if rok2 {
+        different_archives(am.m.module, ver)
+        free_manifest(&raced)
+        remove_tree(tmp)
+    } else {
+        io.eprintln("jog-build: cannot move the cache temp directory into place")
+    }
+    fs.free_str(dest)
+    text.free_str(tmp)
+    text.free_str(ver)
+    free_manifest(&am)
+    return blank, false
 }

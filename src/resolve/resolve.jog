@@ -1,7 +1,7 @@
-// Package src.resolve: the dependency graph. Path specs only. Archive
-// specs are not supported yet, and a version spec is reported as missing
-// from the cache. The walk is depth-first: gray means the module is on
-// the stack, and the emitted order is dependencies first.
+// Package src.resolve: the dependency graph. Path specs, local .jogz
+// archives, and versions already in the cache. The walk is depth-first:
+// gray means the module is on the stack, and the emitted order is
+// dependencies first.
 //
 // "Same folder" is the normalized absolute path, compared
 // case-insensitively. std.c does not bind GetCurrentDirectoryA.
@@ -35,6 +35,7 @@ struct Node {
     spec: str
     dir: str
     hash: str
+    has_version: bool
     requires: list.List<str>
     chain: list.List<str>
 }
@@ -57,6 +58,8 @@ private struct Work {
     chain: list.List<str>
     color: u8
     source: Source
+    hash: str
+    has_version: bool
 }
 
 private struct Walk {
@@ -320,7 +323,7 @@ private fn copy_chain(chain: list.List<str>, extra: str): list.List<str> with (a
     return out
 }
 
-private fn append_chain(b: *strbuilder.StrBuilder, names: list.List<str>, version: manifest.Version, spec: str) with (a: mem.Allocator) {
+private fn append_chain(b: *strbuilder.StrBuilder, names: list.List<str>, version: manifest.Version, kind: str, spec: str) with (a: mem.Allocator) {
     var i: usize = 0
     for i < names.len {
         if i > 0 {
@@ -331,7 +334,7 @@ private fn append_chain(b: *strbuilder.StrBuilder, names: list.List<str>, versio
             b.append(" ")
             manifest.append_version(b, version)
             b.append(" (")
-            b.append("path")
+            b.append(kind)
             b.append(" ")
             b.append(spec)
             b.append(")")
@@ -411,18 +414,18 @@ private fn cycle_message(parent: list.List<str>, repeated: str): str with (a: me
     return text
 }
 
-private fn conflict_message(name: str, first: list.List<str>, first_ver: manifest.Version, first_spec: str, second: list.List<str>, second_ver: manifest.Version, second_spec: str): str with (a: mem.Allocator) {
+private fn conflict_message(name: str, first: list.List<str>, first_ver: manifest.Version, first_kind: str, first_spec: str, second: list.List<str>, second_ver: manifest.Version, second_kind: str, second_spec: str): str with (a: mem.Allocator) {
     var b = strbuilder.empty()
     b.append("jog.mod: error: module '")
     b.append(name)
     b.append("' is required twice, with different sources:\n  ")
-    append_chain(&b, first, first_ver, first_spec)
+    append_chain(&b, first, first_ver, first_kind, first_spec)
     b.append("\n  ")
-    append_chain(&b, second, second_ver, second_spec)
+    append_chain(&b, second, second_ver, second_kind, second_spec)
     b.append("\na build has one version of each module")
-    val text = text.copy_str(b.str())
+    val out = text.copy_str(b.str())
     b.free()
-    return text
+    return out
 }
 
 private fn jog_message(man: manifest.Manifest, have: manifest.Version): str with (a: mem.Allocator) {
@@ -449,7 +452,42 @@ private fn report_missing(name: str, dir: str) with (a: mem.Allocator) {
     b.free()
 }
 
-private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str>): bool with (a: mem.Allocator) {
+// True when left's slash-normalized form sorts strictly before right's.
+// Among several specs for one folder, the lock keeps the earliest, so
+// the file does not depend on require order.
+private fn spec_before(left: str, right: str): bool {
+    var i: usize = 0
+    var j: usize = 0
+    for {
+        if i >= left.len && j >= right.len {
+            return false
+        }
+        if i >= left.len {
+            return true
+        }
+        if j >= right.len {
+            return false
+        }
+        var ca = left.ptr[i]
+        var cb = right.ptr[j]
+        if ca == '\\' as u8 {
+            ca = '/' as u8
+        }
+        if cb == '\\' as u8 {
+            cb = '/' as u8
+        }
+        if ca < cb {
+            return true
+        }
+        if cb < ca {
+            return false
+        }
+        i = i + 1
+        j = j + 1
+    }
+}
+
+private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str>, source: Source, file_hash: str): bool with (a: mem.Allocator) {
     var (man, path, status) = read_mod(dir)
     if status == 1 {
         report_missing(req.module, dir)
@@ -496,7 +534,9 @@ private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str
     w.man = man
     w.chain = chain
     w.color = color_gray
-    w.source = Source.Path
+    w.source = source
+    w.hash = text.copy_str(file_hash)
+    w.has_version = man.has_version
     val idx = self.works.len
     self.works.push(w)
     val key = self.works.get(idx).name
@@ -511,23 +551,7 @@ private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str
     return true
 }
 
-private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<str>): bool with (a: mem.Allocator) {
-    if !req.is_path {
-        val msg = missing_cache_message(req.module, req.spec)
-        io.eprintln(msg)
-        text.free_str(msg)
-        return false
-    }
-    if text.ends_with(req.spec, ".jogz") {
-        var b = strbuilder.empty()
-        b.append("jog.mod: error: archive '")
-        b.append(req.spec)
-        b.append("' is not supported yet")
-        io.eprintln(b.str())
-        b.free()
-        return false
-    }
-    val dir = absolute(from_dir, req.spec)
+private fn *Walk.consider(req: manifest.Require, dir: str, parent: list.List<str>, source: Source, file_hash: str): bool with (a: mem.Allocator) {
     var existing: usize = 0
     if self.index.get(req.module, map.fnv1a(req.module), &existing) {
         val w = self.works.get(existing)
@@ -535,21 +559,24 @@ private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<s
             val msg = cycle_message(parent, req.module)
             io.eprintln(msg)
             text.free_str(msg)
-            text.free_str(dir)
             return false
         }
         if same_folder(w.dir, dir) {
-            text.free_str(dir)
+            if spec_before(req.spec, w.spec) {
+                var updated = self.works.get(existing)
+                val old_spec = updated.spec
+                updated.spec = text.copy_str(req.spec)
+                text.free_str(old_spec)
+                self.works.set(existing, updated)
+            }
             return true
         }
         var (other, path, status) = read_mod(dir)
         if status == 1 {
             report_missing(req.module, dir)
-            text.free_str(dir)
             return false
         }
         if status != 0 {
-            text.free_str(dir)
             return false
         }
         if other.module != req.module {
@@ -562,23 +589,101 @@ private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<s
             print_at(path, other.name_line, other.name_col, b.str())
             b.free()
             text.free_str(path)
-            text.free_str(dir)
             return false
         }
         val second = copy_chain(parent, req.module)
-        val msg = conflict_message(req.module, w.chain, w.version, w.spec, second, other.version, req.spec)
+        val msg = conflict_message(req.module, w.chain, w.version, source_name(w.source), w.spec, second, other.version, source_name(source), req.spec)
         io.eprintln(msg)
         text.free_str(msg)
         text.free_str(path)
-        text.free_str(dir)
         return false
     }
     if self.case_clash(req.module) {
-        text.free_str(dir)
         return false
     }
     val chain = copy_chain(parent, req.module)
-    val ok = self.check_new(dir, req, chain)
+    return self.check_new(dir, req, chain, source, file_hash)
+}
+
+private fn *Walk.visit_archive(req: manifest.Require, from_dir: str, parent: list.List<str>): bool with (a: mem.Allocator) {
+    val jogz = absolute(from_dir, req.spec)
+    val root = cache.dir()
+    if root.len == 0 {
+        io.eprintln("jog-build: no cache directory; set JOG_CACHE or LOCALAPPDATA")
+        text.free_str(jogz)
+        return false
+    }
+    var (am, iok) = cache.install(root, jogz)
+    text.free_str(jogz)
+    if !iok {
+        text.free_str(root)
+        return false
+    }
+    if am.m.module != req.module {
+        var b = strbuilder.empty()
+        b.append("jog.mod: module '")
+        b.append(am.m.module)
+        b.append("' was required as '")
+        b.append(req.module)
+        b.append("'")
+        io.eprintln(b.str())
+        b.free()
+        cache.free_manifest(&am)
+        text.free_str(root)
+        return false
+    }
+    val ver = manifest.version_text(am.m.version)
+    val dir = cache.src_dir(root, am.m.module, ver)
+    val file_hash = text.copy_str(am.hash)
+    cache.free_manifest(&am)
+    text.free_str(ver)
+    text.free_str(root)
+    val ok = self.consider(req, dir, parent, Source.Archive, file_hash)
+    text.free_str(dir)
+    text.free_str(file_hash)
+    return ok
+}
+
+private fn *Walk.visit_version(req: manifest.Require, parent: list.List<str>): bool with (a: mem.Allocator) {
+    val root = cache.dir()
+    var present = false
+    if root.len > 0 {
+        present = cache.has(root, req.module, req.spec)
+    }
+    if !present {
+        val msg = missing_cache_message(req.module, req.spec)
+        io.eprintln(msg)
+        text.free_str(msg)
+        text.free_str(root)
+        return false
+    }
+    var (am, sok) = cache.stored(root, req.module, req.spec)
+    if !sok {
+        io.eprint("jog-build: cannot read the cached manifest for '")
+        io.eprint(req.module)
+        io.eprintln("'")
+        text.free_str(root)
+        return false
+    }
+    val dir = cache.src_dir(root, req.module, req.spec)
+    val file_hash = text.copy_str(am.hash)
+    cache.free_manifest(&am)
+    text.free_str(root)
+    val ok = self.consider(req, dir, parent, Source.Cache, file_hash)
+    text.free_str(dir)
+    text.free_str(file_hash)
+    return ok
+}
+
+private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<str>): bool with (a: mem.Allocator) {
+    if text.ends_with(req.spec, ".jogz") {
+        return self.visit_archive(req, from_dir, parent)
+    }
+    if !req.is_path {
+        return self.visit_version(req, parent)
+    }
+    val dir = absolute(from_dir, req.spec)
+    val ok = self.consider(req, dir, parent, Source.Path, "")
     text.free_str(dir)
     return ok
 }
@@ -601,6 +706,8 @@ private fn node_from(w: Work): Node with (a: mem.Allocator) {
     n.source = w.source
     n.spec = text.copy_str(w.spec)
     n.dir = text.copy_str(w.dir)
+    n.hash = text.copy_str(w.hash)
+    n.has_version = w.has_version
     var i: usize = 0
     for i < w.man.requires.len {
         n.requires.push(text.copy_str(w.man.requires.get(i).module))

@@ -307,3 +307,53 @@ fn semver_precedence() with (t: testing.Testing) {
     t.expect(huge.major.len == 20)
     t.expect(huge.major == "99999999999999999999")
 }
+
+fn compiler_root(): str with (a: mem.Allocator) {
+    val repo = repo_root()
+    val jog = parent_of(repo)
+    val compiler = fs.join(jog, "JogCompiler")
+    text.free_str(repo)
+    text.free_str(jog)
+    return compiler
+}
+
+@test
+fn compiler_manifests_parse() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val base = compiler_root()
+        var rels: list.List<str>
+        rels.push("examples/hello/jog.mod")
+        rels.push("tests/jog/pkg/modules/app/jog.mod")
+        rels.push("tests/jog/pkg/modules/lib/jog.mod")
+        rels.push("tests/jog/pkg/modules/clash/jog.mod")
+        rels.push("tests/jog/pkg/modules/linklib/jog.mod")
+        rels.push("tests/jog/pkg/modules/linkapp/jog.mod")
+        rels.push("tests/jog/pkg/modules/embedapp/jog.mod")
+        rels.push("tests/jog/pkg/modules/embedapp/vendor/badembed/jog.mod")
+        rels.push("tests/jog/pkg/modules/other/jog.mod")
+        rels.push("tests/jog/pkg/modules/plain/jog.mod")
+        rels.push("tests/jog/pkg/modules/shadow/jog.mod")
+        rels.push("tests/jog/pkg/modules/noexport/jog.mod")
+        var i: usize = 0
+        for i < rels.len {
+            val path = fs.join(base, rels.get(i))
+            var (data, ok) = fs.read_all(path)
+            if !ok {
+                t.fail(path)
+                t.fail("\n")
+            } else {
+                val body: str = data
+                var (m, err, parsed) = parse(body)
+                if !parsed {
+                    t.fail(path)
+                    t.fail("\n")
+                    t.fail(err.message)
+                    t.fail("\n")
+                }
+            }
+            i = i + 1
+        }
+    }
+    ar.release()
+}

@@ -397,13 +397,14 @@ private fn repo_root(): str {
 }
 
 private fn ensure_dir(path: str) {
-    var buf: [4096]u8
     if path.len == 0 || path.len >= 4096 {
         return
     }
-    c.memcpy(buf[..].ptr as *void, path.ptr as *const void, path.len)
-    buf[path.len] = 0
-    c.CreateDirectoryA(buf[..].ptr as *const c.char, 0)
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.CreateDirectoryW(wide[..].ptr, 0)
 }
 
 private fn contains_text(hay: str, needle: str): bool {

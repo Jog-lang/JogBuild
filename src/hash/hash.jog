@@ -116,12 +116,16 @@ private fn maj(a: u32, b: u32, c: u32): u32 {
     return (a & b) ^ (a & c) ^ (b & c)
 }
 
+private fn be32_bytes(b0: u8, b1: u8, b2: u8, b3: u8): u32 {
+    val x0 = b0 as u64
+    val x1 = b1 as u64
+    val x2 = b2 as u64
+    val x3 = b3 as u64
+    return ((x0 << 24) | (x1 << 16) | (x2 << 8) | x3) as u32
+}
+
 private fn *Sha256.word_at(off: usize): u32 {
-    val b0 = self.buf[off] as u64
-    val b1 = self.buf[off + 1] as u64
-    val b2 = self.buf[off + 2] as u64
-    val b3 = self.buf[off + 3] as u64
-    return ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) as u32
+    return be32_bytes(self.buf[off], self.buf[off + 1], self.buf[off + 2], self.buf[off + 3])
 }
 
 // FIPS 180-4 section 6.2.2, one 512-bit block in buf.
@@ -227,7 +231,7 @@ fn *Sha256.finish(): [32]u8 {
     return out
 }
 
-private fn copy_text(text: str): str with (a: mem.Allocator) {
+fn copy_text(text: str): str with (a: mem.Allocator) {
     if text.len == 0 {
         return ""
     }

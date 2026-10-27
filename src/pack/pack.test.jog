@@ -1,0 +1,121 @@
+// Package src.pack. Packs testdata/pack/top and checks the archive with
+// zip.read against the fixtures.
+
+import std.arena
+import std.fs
+import std.mem
+import std.os
+import std.strbuilder
+import std.testing
+
+import src.manifest
+import src.resolve
+import src.text
+import src.zip
+
+private fn test_parent(path: str): str with (a: mem.Allocator) {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            return text.copy_str(text.view_range(path, 0, i))
+        }
+    }
+    return ""
+}
+
+private fn repo_root(): str with (a: mem.Allocator) {
+    val exe = os.argv(0)
+    val out_dir = test_parent(exe)
+    val root = test_parent(out_dir)
+    text.free_str(out_dir)
+    return root
+}
+
+private fn jog_ver(): manifest.Version {
+    var (v, ok) = manifest.parse_version("0.0.1")
+    if !ok {
+        panic("0.0.1")
+    }
+    return v
+}
+
+private fn trim_nl(s: str): str {
+    if s.len == 0 || s.ptr[s.len - 1] != '\n' as u8 {
+        return s
+    }
+    return text.view_range(s, 0, s.len - 1)
+}
+
+private fn as_text(data: bytes): str {
+    var out = bytes()
+    out.ptr = data.ptr
+    out.len = data.len
+    return out
+}
+
+@test
+fn pack_top_matches_fixtures() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val root = repo_root()
+        val top = fs.join(root, "testdata/pack/top")
+        var (g, ok) = resolve.resolve(top, jog_ver())
+        t.expect(ok)
+        val dest = fs.join(root, "out/test-pack/top.jogz")
+        var (path, sum, pok) = pack(top, dest, g)
+        t.expect(pok)
+        val want_hash_path = fs.join(root, "testdata/pack/top.hash")
+        var (want_hash_bytes, hok) = fs.read_all(want_hash_path)
+        t.expect(hok)
+        t.expectEq(sum, trim_nl(want_hash_bytes))
+        var (arc, aok) = fs.read_all(path)
+        t.expect(aok)
+        var (ents, msg, rok) = zip.read(arc)
+        t.expect(rok)
+        zip.free_text(msg)
+        var names = strbuilder.empty()
+        var i: usize = 0
+        var jog_mod = bytes()
+        for i < ents.len {
+            val e = ents.get(i)
+            names.append(e.name)
+            names.append("\n")
+            if e.name == "src/jog.mod" {
+                jog_mod = e.data
+            }
+            i = i + 1
+        }
+        val files_path = fs.join(root, "testdata/pack/top.files")
+        var (files_bytes, fok) = fs.read_all(files_path)
+        t.expect(fok)
+        t.expectEq(names.str(), as_text(files_bytes))
+        val src_path = fs.join(root, "testdata/pack/top.src.jog.mod")
+        var (src_bytes, sok) = fs.read_all(src_path)
+        t.expect(sok)
+        t.expect(jog_mod.len == src_bytes.len)
+        if jog_mod.len == src_bytes.len {
+            var k: usize = 0
+            var same = true
+            for k < jog_mod.len {
+                if jog_mod.ptr[k] != src_bytes.ptr[k] {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            t.expect(same)
+        }
+        ents.free()
+        names.free()
+        text.free_str(root)
+        fs.free_str(top)
+        fs.free_str(dest)
+        fs.free_str(path)
+        fs.free_str(want_hash_path)
+        fs.free_str(files_path)
+        fs.free_str(src_path)
+    }
+    ar.release()
+}

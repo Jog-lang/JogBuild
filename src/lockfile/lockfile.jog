@@ -1,34 +1,271 @@
 // Package src.lockfile: jog.lock, written next to jog.mod by build, run,
 // test, pack, and deps. The format is notes/Packages.md, "jog.lock":
-// "lock 1" first, then one dep line per module except the root, sorted by
-// module name, one space between fields, "\n" after every line, no
-// timestamps, no absolute paths. The file is rewritten only when its
-// bytes change. Milestone 10 of notes/Plan.md.
+// a comment line, then "lock 1", then one dep line per module except the
+// root, sorted by module name, one space between fields, "\n" after every
+// line. The file is rewritten only when its bytes change.
+// Milestone 10 of notes/Plan.md.
 //
-// Comments only: every signature needs resolve.Graph, which is a sketch.
-//
-// Sketch:
-//
-// struct Entry {
-//     module: str
-//     version: str         as text, e.g. 0.2.0
-//     source: str          path, archive, or cache
-//     location: str        the require spec as written, with / separators,
-//                          or "-" for cache
-//     hash: str            sha256:<hex>, or "-" for path
-// }
-//
-// Signatures:
-//
-// fn entries(g: resolve.Graph): List<Entry> with (a: mem.Allocator)
-//     Sorted by module name, byte order.
-// fn format(entries: []Entry): str with (a: mem.Allocator)
-// fn write_if_changed(path: str, text: str): bool with (a: mem.Allocator)
-//     fs.read_all the old file; fs.write_all only when the bytes differ.
-// fn parse(text: str): (List<Entry>, bool) with (a: mem.Allocator)
-//     Not needed in V1, which only writes the file. Useful for tests.
+// A path or archive location is the require spec with '\' written as '/'.
+// Resolution keeps, among the specs that name one folder, the one that
+// sorts first in byte order. That does not depend on which require was
+// walked first, so swapping require lines does not change the file.
+// A cache location is "-". A path hash is "-".
 
 import std.fs
 import std.list
 import std.mem
 import std.strbuilder
+
+import src.manifest
+import src.resolve
+import src.text
+
+struct Entry {
+    module: str
+    version: str
+    source: str
+    location: str
+    hash: str
+}
+
+private fn as_bytes(s: str): bytes {
+    var data = bytes()
+    if s.len == 0 {
+        return data
+    }
+    data.ptr = s.ptr as *u8
+    data.len = s.len
+    return data
+}
+
+private fn module_before(left: str, right: str): bool {
+    var n = left.len
+    if right.len < n {
+        n = right.len
+    }
+    var i: usize = 0
+    for i < n {
+        val lb = left.ptr[i]
+        val rb = right.ptr[i]
+        if lb < rb {
+            return true
+        }
+        if rb < lb {
+            return false
+        }
+        i = i + 1
+    }
+    return left.len < right.len
+}
+
+private fn sort_entries(xs: *list.List<Entry>) {
+    var i: usize = 1
+    for i < xs.len {
+        val key = xs.get(i)
+        var j = i
+        for j > 0 {
+            if !module_before(key.module, xs.get(j - 1).module) {
+                break
+            }
+            xs.set(j, xs.get(j - 1))
+            j = j - 1
+        }
+        xs.set(j, key)
+        i = i + 1
+    }
+}
+
+fn slash_spec(spec: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    var i: usize = 0
+    for i < spec.len {
+        var c = spec.ptr[i]
+        if c == '\\' as u8 {
+            c = '/' as u8
+        }
+        b.append_byte(c)
+        i = i + 1
+    }
+    val out = text.copy_str(b.str())
+    b.free()
+    return out
+}
+
+fn free_entries(xs: *list.List<Entry>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < xs.len {
+        val e = xs.get(i)
+        text.free_str(e.module)
+        text.free_str(e.version)
+        text.free_str(e.source)
+        text.free_str(e.location)
+        text.free_str(e.hash)
+        i = i + 1
+    }
+    xs.free()
+}
+
+fn entries(g: resolve.Graph): list.List<Entry> with (a: mem.Allocator) {
+    var xs: list.List<Entry>
+    var i: usize = 0
+    for i < g.nodes.len {
+        val n = g.nodes.get(i)
+        var e: Entry
+        e.module = text.copy_str(n.name)
+        e.version = manifest.version_text(n.version)
+        val kind = resolve.source_name(n.source)
+        e.source = text.copy_str(kind)
+        if kind == "cache" {
+            e.location = text.copy_str("-")
+        } else {
+            e.location = slash_spec(n.spec)
+        }
+        if kind == "path" {
+            e.hash = text.copy_str("-")
+        } else {
+            e.hash = text.copy_str(n.hash)
+        }
+        xs.push(e)
+        i = i + 1
+    }
+    sort_entries(&xs)
+    return xs
+}
+
+fn format(items: []Entry): str with (a: mem.Allocator) {
+    var xs: list.List<Entry>
+    var i: usize = 0
+    for i < items.len {
+        xs.push(items[i])
+        i = i + 1
+    }
+    sort_entries(&xs)
+    var b = strbuilder.empty()
+    b.append("# jog.lock: written by jog-build, do not edit\n")
+    b.append("lock 1\n")
+    i = 0
+    for i < xs.len {
+        val e = xs.get(i)
+        b.append("dep ")
+        b.append(e.module)
+        b.append(" ")
+        b.append(e.version)
+        b.append(" ")
+        b.append(e.source)
+        b.append(" ")
+        b.append(e.location)
+        b.append(" ")
+        b.append(e.hash)
+        b.append("\n")
+        i = i + 1
+    }
+    xs.free()
+    val out = text.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn same_bytes(data: bytes, body: str): bool {
+    if data.len != body.len {
+        return false
+    }
+    var i: usize = 0
+    for i < data.len {
+        if data.ptr[i] != body.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn write_if_changed(path: str, body: str): bool with (a: mem.Allocator) {
+    var (old, ok) = fs.read_all(path)
+    if ok {
+        val same = same_bytes(old, body)
+        if old.len > 0 {
+            a.free(old)
+        }
+        if same {
+            return true
+        }
+    }
+    return fs.write_all(path, as_bytes(body))
+}
+
+private fn fail_parse(xs: list.List<Entry>): (list.List<Entry>, bool) with (a: mem.Allocator) {
+    var gone = xs
+    free_entries(&gone)
+    var empty: list.List<Entry>
+    return empty, false
+}
+
+fn parse(src: str): (list.List<Entry>, bool) with (a: mem.Allocator) {
+    var xs: list.List<Entry>
+    var saw_lock = false
+    var at: usize = 0
+    for at < src.len {
+        val start = at
+        for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
+            at = at + 1
+        }
+        val line = text.view_range(src, start, at)
+        if at < src.len && src.ptr[at] == '\r' as u8 {
+            at = at + 1
+        }
+        if at < src.len && src.ptr[at] == '\n' as u8 {
+            at = at + 1
+        }
+        if line.len == 0 || line.ptr[0] == '#' as u8 {
+            continue
+        }
+        var words: list.List<str>
+        var i: usize = 0
+        var bad_line = false
+        for i < line.len {
+            if line.ptr[i] == ' ' as u8 {
+                i = i + 1
+                continue
+            }
+            val wstart = i
+            for i < line.len && line.ptr[i] != ' ' as u8 {
+                i = i + 1
+            }
+            words.push(text.view_range(line, wstart, i))
+        }
+        if words.len == 0 {
+            words.free()
+            continue
+        }
+        val head = words.get(0)
+        if head == "lock" {
+            if saw_lock || words.len != 2 || words.get(1) != "1" {
+                bad_line = true
+            } else {
+                saw_lock = true
+            }
+        } else if head == "dep" {
+            if !saw_lock || words.len != 6 {
+                bad_line = true
+            } else {
+                var e: Entry
+                e.module = text.copy_str(words.get(1))
+                e.version = text.copy_str(words.get(2))
+                e.source = text.copy_str(words.get(3))
+                e.location = text.copy_str(words.get(4))
+                e.hash = text.copy_str(words.get(5))
+                xs.push(e)
+            }
+        } else {
+            bad_line = true
+        }
+        words.free()
+        if bad_line {
+            return fail_parse(xs)
+        }
+    }
+    if !saw_lock {
+        return fail_parse(xs)
+    }
+    return xs, true
+}

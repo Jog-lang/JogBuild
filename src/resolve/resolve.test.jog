@@ -1,6 +1,5 @@
 import std.arena
 import std.fs
-import std.list
 import std.mem
 import std.os
 import std.testing

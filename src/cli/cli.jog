@@ -9,19 +9,24 @@
 // when there was no "--".
 
 import std.arena
+import std.c
+import std.fs
 import std.io
 import std.list
 import std.mem
 import std.os
 import std.strbuilder
 
-import src.cache
 import src.compiler
 import src.lockfile
 import src.manifest
 import src.pack
 import src.resolve
 import src.text
+
+private extern {
+    fn GetCurrentDirectoryA(cap: c.unsigned_long, buffer: *c.char): c.unsigned_long
+}
 
 struct Flags {
     release: bool
@@ -219,9 +224,148 @@ private fn apply_short(command: str, f: *Flags, arg: str, args: []str, i: usize)
     return false, 0
 }
 
-// Milestone 11. Writes jog.mod, main.jog or <name>.jog, and .gitignore.
+private fn as_bytes(s: str): bytes {
+    var data = bytes()
+    if s.len == 0 {
+        return data
+    }
+    data.ptr = s.ptr as *u8
+    data.len = s.len
+    return data
+}
+
+private fn write_lock(root: str, g: resolve.Graph): bool with (a: mem.Allocator) {
+    var ents = lockfile.entries(g)
+    val body = lockfile.format(ents.slice_view())
+    val path = fs.join(root, "jog.lock")
+    val ok = lockfile.write_if_changed(path, body)
+    lockfile.free_entries(&ents)
+    text.free_str(body)
+    fs.free_str(path)
+    if !ok {
+        io.eprintln("jog-build: cannot write jog.lock")
+    }
+    return ok
+}
+
+private fn cwd_path(): (str, bool) with (a: mem.Allocator) {
+    var buf: [4096]u8
+    val n = GetCurrentDirectoryA(4096, buf[..].ptr as *c.char)
+    if n == 0 || n >= 4096 {
+        return "", false
+    }
+    var view = bytes()
+    view.ptr = buf[..].ptr
+    view.len = n as usize
+    return text.copy_str(view as str), true
+}
+
+private fn path_name(path: str): str with (a: mem.Allocator) {
+    var end = path.len
+    if end > 0 {
+        val c = path.ptr[end - 1]
+        if c == '/' as u8 || c == '\\' as u8 {
+            end = end - 1
+        }
+    }
+    var slash: i64 = -1
+    var i: usize = 0
+    for i < end {
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            slash = i as i64
+        }
+        i = i + 1
+    }
+    if slash < 0 {
+        return text.copy_str(text.view_range(path, 0, end))
+    }
+    return text.copy_str(text.view_range(path, (slash as usize) + 1, end))
+}
+
+private fn init_in(f: Flags): i32 with (a: mem.Allocator) {
+    var name: str = ""
+    if f.name.len > 0 {
+        name = f.name
+    } else {
+        var (dir, dok) = cwd_path()
+        if !dok {
+            io.eprintln("jog-build init: cannot read the current directory")
+            return 1
+        }
+        name = path_name(dir)
+    }
+    if !manifest.is_ident(name) {
+        io.eprint("jog-build init: '")
+        io.eprint(name)
+        io.eprintln("' is not an identifier; pass a name")
+        return 1
+    }
+    var (existing, found) = fs.read_all("jog.mod")
+    if found {
+        if existing.len > 0 {
+            a.free(existing)
+        }
+        io.eprintln("jog-build init: jog.mod already exists")
+        return 1
+    }
+    var (jog, jok) = compiler.find()
+    if !jok {
+        io.eprintln("jog-build: compiler not found. Set JOG, or put jog.exe on PATH")
+        return 1
+    }
+    var (ver, vok) = compiler.version(jog)
+    if !vok {
+        io.eprintln("jog-build: cannot read the compiler version")
+        return 1
+    }
+    var m: manifest.Manifest
+    m.module = name
+    m.has_version = true
+    var (parsed, pok) = manifest.parse_version("0.1.0")
+    if !pok {
+        io.eprintln("jog-build init: 0.1.0 is not a version")
+        return 1
+    }
+    m.version = parsed
+    m.has_kind = true
+    m.library = f.lib
+    m.has_jog = true
+    m.jog = ver
+    val body = manifest.format(m)
+    if !fs.write_all("jog.mod", as_bytes(body)) {
+        io.eprintln("jog-build init: cannot write jog.mod")
+        return 1
+    }
+    var file_name: str = "main.jog"
+    var file_body: str = "fn main() {\n}\n"
+    if f.lib {
+        var b = strbuilder.empty()
+        b.append(name)
+        b.append(".jog")
+        file_name = text.copy_str(b.str())
+        b.free()
+        file_body = "fn ready(): bool {\n    return true\n}\n"
+    }
+    if !fs.write_all(file_name, as_bytes(file_body)) {
+        io.eprintln("jog-build init: cannot write the root file")
+        return 1
+    }
+    if !fs.write_all(".gitignore", as_bytes("out/\n")) {
+        io.eprintln("jog-build init: cannot write .gitignore")
+        return 1
+    }
+    return 0
+}
+
 fn cmd_init(f: Flags): i32 with (a: mem.Allocator) {
-    return not_yet("init")
+    var ar = arena.init(0)
+    var code: i32 = 1
+    with (&ar) {
+        code = init_in(f)
+    }
+    ar.release()
+    return code
 }
 
 private struct Loaded {
@@ -260,6 +404,9 @@ private fn load(): (Loaded, bool) with (a: mem.Allocator) {
 private fn build_in(f: Flags): i32 with (a: mem.Allocator) {
     var (loaded, ok) = load()
     if !ok {
+        return 1
+    }
+    if !write_lock(loaded.root, loaded.graph) {
         return 1
     }
     var mods = compiler.module_flags(loaded.graph)
@@ -306,6 +453,9 @@ private fn run_in(f: Flags, args: []str): i32 with (a: mem.Allocator) {
     if !ok {
         return 1
     }
+    if !write_lock(loaded.root, loaded.graph) {
+        return 1
+    }
     var mods = compiler.module_flags(loaded.graph)
     var extra: list.List<str>
     if f.target.len > 0 {
@@ -339,6 +489,9 @@ private fn test_in(f: Flags): i32 with (a: mem.Allocator) {
     if !ok {
         return 1
     }
+    if !write_lock(loaded.root, loaded.graph) {
+        return 1
+    }
     var mods = compiler.module_flags(loaded.graph)
     // jog test accepts a package path or --all, not both. The absolute
     // root already loads the whole module's tests, including with --all,
@@ -358,13 +511,58 @@ fn cmd_test(f: Flags): i32 with (a: mem.Allocator) {
     return code
 }
 
+private fn pack_in(f: Flags): i32 with (a: mem.Allocator) {
+    var (loaded, ok) = load()
+    if !ok {
+        return 1
+    }
+    if !write_lock(loaded.root, loaded.graph) {
+        return 1
+    }
+    if !loaded.graph.root.library {
+        io.eprint("jog-build pack: module '")
+        io.eprint(loaded.graph.root.module)
+        io.eprintln("' is not a library")
+        return 1
+    }
+    if !loaded.graph.root.has_version {
+        io.eprint("jog-build pack: module '")
+        io.eprint(loaded.graph.root.module)
+        io.eprintln("' has no version")
+        return 1
+    }
+    var mods = compiler.module_flags(loaded.graph)
+    var extra: list.List<str>
+    var argv = compiler.command(loaded.jog, "check", loaded.root, mods.slice_view(), extra.slice_view())
+    val code = compiler.run_jog(argv.slice_view())
+    if code != 0 {
+        return code
+    }
+    var (path, sum, pok) = pack.pack(loaded.root, f.output, loaded.graph)
+    if !pok {
+        return 1
+    }
+    io.println(path)
+    io.println(sum)
+    return 0
+}
+
 fn cmd_pack(f: Flags): i32 with (a: mem.Allocator) {
-    return not_yet("pack")
+    var ar = arena.init(0)
+    var code: i32 = 1
+    with (&ar) {
+        code = pack_in(f)
+    }
+    ar.release()
+    return code
 }
 
 private fn deps_in(f: Flags): i32 with (a: mem.Allocator) {
     var (loaded, ok) = load()
     if !ok {
+        return 1
+    }
+    if !write_lock(loaded.root, loaded.graph) {
         return 1
     }
     if f.flags_only {

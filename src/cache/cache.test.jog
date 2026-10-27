@@ -1,0 +1,457 @@
+// Package src.cache. Installs the lib archive under out/test-cache and
+// rejects a bad CRC, a different hash, and unsafe entry names.
+
+import std.arena
+import std.c
+import std.fs
+import std.io
+import std.list
+import std.mem
+import std.os
+import std.strbuilder
+import std.testing
+
+import src.hash
+import src.text
+import src.zip
+
+private fn test_parent(path: str): str with (a: mem.Allocator) {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            return text.copy_str(text.view_range(path, 0, i))
+        }
+    }
+    return ""
+}
+
+private fn repo_root(): str with (a: mem.Allocator) {
+    val exe = os.argv(0)
+    val out_dir = test_parent(exe)
+    val root = test_parent(out_dir)
+    text.free_str(out_dir)
+    return root
+}
+
+private fn test_mkdir(path: str) {
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.CreateDirectoryW(wide[..].ptr, 0)
+}
+
+private fn test_rel(prefix: str, name: str): str with (a: mem.Allocator) {
+    if prefix.len == 0 {
+        return text.copy_str(name)
+    }
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append("/")
+    b.append(name)
+    val out = text.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn test_has(names: list.List<str>, needle: str): bool {
+    var i: usize = 0
+    for i < names.len {
+        if names.get(i) == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn test_before(left: str, right: str): bool {
+    var n = left.len
+    if right.len < n {
+        n = right.len
+    }
+    var i: usize = 0
+    for i < n {
+        if left.ptr[i] < right.ptr[i] {
+            return true
+        }
+        if right.ptr[i] < left.ptr[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return left.len < right.len
+}
+
+private fn test_sort(files: *list.List<hash.File>) {
+    var i: usize = 1
+    for i < files.len {
+        val key = files.get(i)
+        var j = i
+        for j > 0 {
+            if !test_before(key.name, files.get(j - 1).name) {
+                break
+            }
+            files.set(j, files.get(j - 1))
+            j = j - 1
+        }
+        files.set(j, key)
+        i = i + 1
+    }
+}
+
+private fn collect(dir: str, prefix: str, files: *list.List<hash.File>): bool with (a: mem.Allocator) {
+    var (names, ok) = fs.list(dir)
+    if !ok {
+        return false
+    }
+    var i: usize = 0
+    var failed = false
+    for i < names.len {
+        if failed {
+            break
+        }
+        val name = names.get(i)
+        if text.starts_with(name, ".") || name == "jog.lock" || text.ends_with(name, ".test.jog") {
+            i = i + 1
+            continue
+        }
+        val child = fs.join(dir, name)
+        var (sub, is_dir) = fs.list(child)
+        if is_dir {
+            var skip = name == "out"
+            if !skip {
+                skip = test_has(sub, "jog.mod")
+            }
+            fs.free_names(&sub)
+            if !skip {
+                val rel = test_rel(prefix, name)
+                if !collect(child, rel, files) {
+                    failed = true
+                }
+                text.free_str(rel)
+            }
+        } else {
+            var (data, rok) = fs.read_all(child)
+            if !rok {
+                failed = true
+            } else {
+                var f: hash.File
+                f.name = test_rel(prefix, name)
+                f.data = data
+                files.push(f)
+            }
+        }
+        fs.free_str(child)
+        i = i + 1
+    }
+    fs.free_names(&names)
+    return !failed
+}
+
+private fn manifest_text(sum: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("archive 1\nmodule lib\nversion 0.2.0\nkind library\njog 0.0.1\nexport shapes\nhash ")
+    b.append(sum)
+    b.append("\n")
+    val out = text.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn as_bytes(s: str): bytes {
+    var data = bytes()
+    data.ptr = s.ptr as *u8
+    data.len = s.len
+    return data
+}
+
+private fn extra_bang(data: bytes): (bytes, bool) with (a: mem.Allocator) {
+    val (raw, err) = a.alloc(data.len + 1, align(u8))
+    if err != null {
+        var empty = bytes()
+        return empty, false
+    }
+    if data.len > 0 {
+        c.memcpy(raw.ptr as *void, data.ptr as *const void, data.len)
+    }
+    raw.ptr[data.len] = '!' as u8
+    return raw, true
+}
+
+private fn zip_lib(files: list.List<hash.File>, sum: str): bytes with (a: mem.Allocator) {
+    val man = manifest_text(sum)
+    var ents: list.List<zip.Entry>
+    var first: zip.Entry
+    first.name = "manifest"
+    first.data = as_bytes(man)
+    ents.push(first)
+    var names: list.List<str>
+    var i: usize = 0
+    for i < files.len {
+        var b = strbuilder.empty()
+        b.append("src/")
+        b.append(files.get(i).name)
+        val ename = text.copy_str(b.str())
+        b.free()
+        names.push(ename)
+        var e: zip.Entry
+        e.name = ename
+        e.data = files.get(i).data
+        ents.push(e)
+        i = i + 1
+    }
+    val arc = zip.write(ents.slice_view())
+    ents.free()
+    var k: usize = 0
+    for k < names.len {
+        text.free_str(names.get(k))
+        k = k + 1
+    }
+    names.free()
+    text.free_str(man)
+    return arc
+}
+
+private fn trim_nl(s: str): str {
+    if s.len == 0 || s.ptr[s.len - 1] != '\n' as u8 {
+        return s
+    }
+    return text.view_range(s, 0, s.len - 1)
+}
+
+private fn load_lib(): (list.List<hash.File>, str, bool) with (a: mem.Allocator) {
+    var files: list.List<hash.File>
+    val root = repo_root()
+    val lib = fs.join(root, "testdata/modules/lib")
+    val ok = collect(lib, "", &files)
+    fs.free_str(lib)
+    text.free_str(root)
+    if !ok {
+        return files, "", false
+    }
+    test_sort(&files)
+    val sum = hash.content_hash(files.slice_view())
+    return files, sum, true
+}
+
+private fn write_zip(path: str, arc: bytes) {
+    val slash = path
+    var i = slash.len
+    var parent = ""
+    for i > 0 {
+        i = i - 1
+        val c = slash.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            parent = text.view_range(slash, 0, i)
+            break
+        }
+    }
+    if parent.len > 0 {
+        test_mkdir(parent)
+    }
+    if !fs.write_all(path, arc) {
+        io.eprint("cannot write ")
+        io.eprintln(path)
+    }
+}
+
+@test
+fn install_lib_archive() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var (files, sum, ok) = load_lib()
+        t.expect(ok)
+        t.expect(files.len == 6)
+        val root = repo_root()
+        val hash_path = fs.join(root, "testdata/hash/lib.hash")
+        var (want_bytes, hok) = fs.read_all(hash_path)
+        t.expect(hok)
+        val want = trim_nl(want_bytes)
+        t.expectEq(sum, want)
+        val cache = fs.join(root, "out/test-cache/lib")
+        val jogz = fs.join(root, "out/test-cache/lib-0.2.0.jogz")
+        test_mkdir(fs.join(root, "out/test-cache"))
+        val arc = zip_lib(files, sum)
+        write_zip(jogz, arc)
+        var (am, iok) = install(cache, jogz)
+        t.expect(iok)
+        if iok {
+            t.expectEq(am.hash, sum)
+            t.expect(am.m.module == "lib")
+        }
+        var (am2, iok2) = install(cache, jogz)
+        t.expect(iok2)
+        if iok2 {
+            t.expectEq(am2.hash, sum)
+        }
+        val man = fs.join(cache, "mod/lib/0.2.0/manifest")
+        val src = fs.join(cache, "mod/lib/0.2.0/src")
+        var (man_bytes, mok) = fs.read_all(man)
+        t.expect(mok)
+        var (listed, lok) = fs.list(src)
+        t.expect(lok)
+        if lok {
+            fs.free_names(&listed)
+        }
+        val src_hash_dir = src
+        var extracted: list.List<hash.File>
+        t.expect(collect(src_hash_dir, "", &extracted))
+        test_sort(&extracted)
+        val got = hash.content_hash(extracted.slice_view())
+        t.expectEq(got, want)
+        text.free_str(root)
+        fs.free_str(hash_path)
+        fs.free_str(cache)
+        fs.free_str(jogz)
+        fs.free_str(man)
+        fs.free_str(src)
+        t.expect(man_bytes.len > 0)
+    }
+    ar.release()
+}
+
+@test
+fn reject_changed_byte() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var (files, sum, ok) = load_lib()
+        t.expect(ok)
+        val root = repo_root()
+        val cache = fs.join(root, "out/test-cache/crc")
+        val jogz = fs.join(root, "out/test-cache/crc-lib.jogz")
+        var arc = zip_lib(files, sum)
+        t.expect(arc.len > 40)
+        arc.ptr[40] = arc.ptr[40] ^ 0xFF as u8
+        write_zip(jogz, arc)
+        var (am, iok) = install(cache, jogz)
+        t.expect(!iok)
+        t.expect(am.hash.len == 0)
+        val man = fs.join(cache, "mod/lib/0.2.0/manifest")
+        var (data, exists) = fs.read_all(man)
+        t.expect(!exists)
+        t.expect(data.len == 0)
+        text.free_str(root)
+        fs.free_str(cache)
+        fs.free_str(jogz)
+        fs.free_str(man)
+    }
+    ar.release()
+}
+
+@test
+fn reject_different_hash() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        var (files, sum, ok) = load_lib()
+        t.expect(ok)
+        val root = repo_root()
+        val cache = fs.join(root, "out/test-cache/diff")
+        val first = fs.join(root, "out/test-cache/diff-a.jogz")
+        val second = fs.join(root, "out/test-cache/diff-b.jogz")
+        val arc = zip_lib(files, sum)
+        write_zip(first, arc)
+        var (am, iok) = install(cache, first)
+        t.expect(iok)
+        if iok {
+            t.expect(am.hash.len > 0)
+        }
+        var changed: list.List<hash.File>
+        var i: usize = 0
+        for i < files.len {
+            var f = files.get(i)
+            if f.name == "data/banner.txt" {
+                var (extra, eok) = extra_bang(f.data)
+                t.expect(eok)
+                if eok {
+                    f.data = extra
+                }
+            }
+            changed.push(f)
+            i = i + 1
+        }
+        val sum2 = hash.content_hash(changed.slice_view())
+        t.expect(sum2 != sum)
+        val arc2 = zip_lib(changed, sum2)
+        write_zip(second, arc2)
+        var (am2, iok2) = install(cache, second)
+        t.expect(!iok2)
+        t.expect(am2.hash.len == 0)
+        val banner = fs.join(cache, "mod/lib/0.2.0/src/data/banner.txt")
+        var (kept, kok) = fs.read_all(banner)
+        t.expect(kok)
+        var banner_len: usize = 0
+        var bi: usize = 0
+        for bi < files.len {
+            if files.get(bi).name == "data/banner.txt" {
+                banner_len = files.get(bi).data.len
+            }
+            bi = bi + 1
+        }
+        t.expect(kept.len == banner_len)
+        text.free_str(root)
+        fs.free_str(cache)
+        fs.free_str(first)
+        fs.free_str(second)
+        fs.free_str(banner)
+        t.expect(kept.len > 0)
+    }
+    ar.release()
+}
+
+@test
+fn reject_bad_names() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val root = repo_root()
+        val base = fs.join(root, "out/test-cache/names")
+        test_mkdir(fs.join(root, "out/test-cache"))
+        test_mkdir(base)
+        var bad: list.List<str>
+        bad.push("../x")
+        bad.push("/x")
+        bad.push("a\\b")
+        bad.push("C:x")
+        var i: usize = 0
+        for i < bad.len {
+            var ents: list.List<zip.Entry>
+            var e: zip.Entry
+            e.name = bad.get(i)
+            e.data = as_bytes("hi")
+            ents.push(e)
+            val arc = zip.write(ents.slice_view())
+            var (read_ents, msg, rok) = zip.read(arc)
+            t.expect(!rok)
+            zip.free_text(msg)
+            read_ents.free()
+            val path = fs.join(base, "bad.jogz")
+            write_zip(path, arc)
+            var (am, iok) = install(base, path)
+            t.expect(!iok)
+            t.expect(am.hash.len == 0)
+            val man = fs.join(base, "mod")
+            var (listed, lok) = fs.list(man)
+            t.expect(!lok)
+            if lok {
+                fs.free_names(&listed)
+            }
+            ents.free()
+            fs.free_str(path)
+            fs.free_str(man)
+            i = i + 1
+        }
+        val slipped = fs.join(root, "out/test-cache/x")
+        var (slip, sok) = fs.read_all(slipped)
+        t.expect(!sok)
+        t.expect(slip.len == 0)
+        text.free_str(root)
+        fs.free_str(base)
+        fs.free_str(slipped)
+    }
+    ar.release()
+}

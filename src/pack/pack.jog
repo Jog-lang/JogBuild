@@ -14,27 +14,10 @@
 //    own jog.mod (or archive manifest). Every other line is copied.
 // 5. Compute the content hash over src/, write the manifest entry,
 //    write the zip, print the path and the hash.
-//
-// Comments only: every signature needs resolve.Graph or zip.Entry.
-//
-// Sketch:
-//
-// struct Collected {
-//     names: List<str>     relative to the module root, / separated, sorted
-//     data: List<bytes>    same order
-// }
-//
-// Signatures:
-//
-// fn collect(root_dir: str): (Collected, bool) with (a: mem.Allocator)
-//     fs.list is sorted but has no file or folder flag; see Plan.md,
-//     milestone 8, for telling them apart.
-// fn rewrite_jog_mod(text: str, g: resolve.Graph): str with (a: mem.Allocator)
-// fn archive_manifest(m: manifest.Manifest, hash: str): str with (a: mem.Allocator)
-// fn pack(root_dir: str, output: str, g: resolve.Graph): (str, str, bool) with (a: mem.Allocator)
-//     Returns the archive path and the content hash.
 
+import std.c
 import std.fs
+import std.io
 import std.list
 import std.mem
 import std.strbuilder
@@ -42,4 +25,502 @@ import std.strbuilder
 import src.hash
 import src.manifest
 import src.resolve
+import src.text
 import src.zip
+
+struct Collected {
+    names: list.List<str>
+    data: list.List<bytes>
+}
+
+private fn as_bytes(s: str): bytes {
+    var data = bytes()
+    if s.len == 0 {
+        return data
+    }
+    data.ptr = s.ptr as *u8
+    data.len = s.len
+    return data
+}
+
+private fn ensure_dir(path: str) {
+    if path.len == 0 || path.len >= 4096 {
+        return
+    }
+    var wide: [4096]u16
+    if !c.utf8_to_wide(path, wide[..].ptr, 4096) {
+        return
+    }
+    c.CreateDirectoryW(wide[..].ptr, 0)
+}
+
+private fn parent_of(path: str): str {
+    var i = path.len
+    for i > 0 {
+        i = i - 1
+        val c = path.ptr[i]
+        if c == '/' as u8 || c == '\\' as u8 {
+            if i == 0 {
+                return text.view_range(path, 0, 1)
+            }
+            return text.view_range(path, 0, i)
+        }
+    }
+    return ""
+}
+
+private fn name_before(left: str, right: str): bool {
+    var n = left.len
+    if right.len < n {
+        n = right.len
+    }
+    var i: usize = 0
+    for i < n {
+        val lb = left.ptr[i]
+        val rb = right.ptr[i]
+        if lb < rb {
+            return true
+        }
+        if rb < lb {
+            return false
+        }
+        i = i + 1
+    }
+    return left.len < right.len
+}
+
+private fn rel_join(prefix: str, name: str): str with (a: mem.Allocator) {
+    if prefix.len == 0 {
+        return text.copy_str(name)
+    }
+    var b = strbuilder.empty()
+    b.append(prefix)
+    b.append("/")
+    b.append(name)
+    val out = text.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn has_name(names: list.List<str>, needle: str): bool {
+    var i: usize = 0
+    for i < names.len {
+        if names.get(i) == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn free_collected(c: *Collected) with (a: mem.Allocator) {
+    var i: usize = 0
+    var n = c.names.len
+    if c.data.len < n {
+        n = c.data.len
+    }
+    for i < n {
+        text.free_str(c.names.get(i))
+        val blob = c.data.get(i)
+        if blob.len > 0 {
+            a.free(blob)
+        }
+        i = i + 1
+    }
+    c.names.free()
+    c.data.free()
+}
+
+private fn sort_collected(c: *Collected) {
+    var i: usize = 1
+    for i < c.names.len {
+        val key_name = c.names.get(i)
+        val key_data = c.data.get(i)
+        var j = i
+        for j > 0 {
+            if !name_before(key_name, c.names.get(j - 1)) {
+                break
+            }
+            c.names.set(j, c.names.get(j - 1))
+            c.data.set(j, c.data.get(j - 1))
+            j = j - 1
+        }
+        c.names.set(j, key_name)
+        c.data.set(j, key_data)
+        i = i + 1
+    }
+}
+
+// false means the directory could not be read. Collected may hold a
+// partial tree; the caller frees it.
+private fn walk(dir: str, prefix: str, c: *Collected): bool with (a: mem.Allocator) {
+    var (names, ok) = fs.list(dir)
+    if !ok {
+        io.eprint("jog-build pack: cannot list ")
+        io.eprintln(dir)
+        return false
+    }
+    var i: usize = 0
+    var failed = false
+    for i < names.len {
+        if failed {
+            break
+        }
+        val name = names.get(i)
+        if text.starts_with(name, ".") || name == "jog.lock" || text.ends_with(name, ".test.jog") {
+            i = i + 1
+            continue
+        }
+        val child = fs.join(dir, name)
+        var (sub, is_dir) = fs.list(child)
+        if is_dir {
+            var skip = name == "out"
+            if !skip {
+                skip = has_name(sub, "jog.mod")
+            }
+            fs.free_names(&sub)
+            if skip {
+                fs.free_str(child)
+            } else {
+                val rel = rel_join(prefix, name)
+                if !walk(child, rel, c) {
+                    failed = true
+                }
+                text.free_str(rel)
+                fs.free_str(child)
+            }
+        } else {
+            var (data, rok) = fs.read_all(child)
+            if !rok {
+                io.eprint("jog-build pack: cannot read ")
+                io.eprintln(child)
+                fs.free_str(child)
+                failed = true
+            } else {
+                fs.free_str(child)
+                c.names.push(rel_join(prefix, name))
+                c.data.push(data)
+            }
+        }
+        i = i + 1
+    }
+    fs.free_names(&names)
+    return !failed
+}
+
+fn collect(root_dir: str): (Collected, bool) with (a: mem.Allocator) {
+    var c: Collected
+    val ok = walk(root_dir, "", &c)
+    if ok {
+        sort_collected(&c)
+    }
+    return c, ok
+}
+
+private fn is_require_line(line: str): bool {
+    var i: usize = 0
+    for i < line.len {
+        val c = line.ptr[i]
+        if c == ' ' as u8 || c == '\t' as u8 {
+            i = i + 1
+            continue
+        }
+        break
+    }
+    if i >= line.len || line.ptr[i] == '#' as u8 {
+        return false
+    }
+    val rest = text.view_range(line, i, line.len)
+    if !text.starts_with(rest, "require") {
+        return false
+    }
+    if rest.len == 7 {
+        return true
+    }
+    val n = rest.ptr[7]
+    return n == ' ' as u8 || n == '\t' as u8
+}
+
+private fn dep_version(g: resolve.Graph, name: str): (str, bool) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < g.nodes.len {
+        val n = g.nodes.get(i)
+        if n.name == name {
+            if !n.has_version {
+                io.eprint("jog-build pack: module '")
+                io.eprint(name)
+                io.eprintln("' has no version")
+                return "", false
+            }
+            return manifest.version_text(n.version), true
+        }
+        i = i + 1
+    }
+    io.eprint("jog-build pack: module '")
+    io.eprint(name)
+    io.eprintln("' was not resolved")
+    return "", false
+}
+
+fn rewrite_jog_mod(src: str, g: resolve.Graph): (str, bool) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    var req_i: usize = 0
+    var at: usize = 0
+    var failed = false
+    for at < src.len {
+        if failed {
+            break
+        }
+        val start = at
+        for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
+            at = at + 1
+        }
+        val line = text.view_range(src, start, at)
+        val end = at
+        if at < src.len && src.ptr[at] == '\r' as u8 {
+            at = at + 1
+        }
+        if at < src.len && src.ptr[at] == '\n' as u8 {
+            at = at + 1
+        }
+        if is_require_line(line) {
+            if req_i >= g.root.requires.len {
+                failed = true
+                break
+            }
+            val r = g.root.requires.get(req_i)
+            req_i = req_i + 1
+            if r.is_path {
+                var (ver, vok) = dep_version(g, r.module)
+                if !vok {
+                    text.free_str(ver)
+                    failed = true
+                    break
+                }
+                b.append("require ")
+                b.append(r.module)
+                b.append(" ")
+                b.append(ver)
+                text.free_str(ver)
+                if end < at {
+                    b.append(text.view_range(src, end, at))
+                }
+            } else {
+                b.append(text.view_range(src, start, at))
+            }
+        } else {
+            b.append(text.view_range(src, start, at))
+        }
+    }
+    if !failed && req_i != g.root.requires.len {
+        failed = true
+    }
+    if failed {
+        b.free()
+        return "", false
+    }
+    val out = text.copy_str(b.str())
+    b.free()
+    return out, true
+}
+
+fn archive_manifest(m: manifest.Manifest, g: resolve.Graph, sum: str): (str, bool) with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("archive 1\n")
+    b.append("module ")
+    b.append(m.module)
+    b.append("\n")
+    b.append("version ")
+    manifest.append_version(&b, m.version)
+    b.append("\n")
+    b.append("kind library\n")
+    if m.has_jog {
+        b.append("jog ")
+        manifest.append_version(&b, m.jog)
+        b.append("\n")
+    }
+    var i: usize = 0
+    var failed = false
+    for i < m.requires.len {
+        if failed {
+            break
+        }
+        val r = m.requires.get(i)
+        b.append("require ")
+        b.append(r.module)
+        b.append(" ")
+        if r.is_path {
+            var (ver, vok) = dep_version(g, r.module)
+            if !vok {
+                text.free_str(ver)
+                failed = true
+                break
+            }
+            b.append(ver)
+            text.free_str(ver)
+        } else {
+            b.append(r.spec)
+        }
+        b.append("\n")
+        i = i + 1
+    }
+    if failed {
+        b.free()
+        return "", false
+    }
+    i = 0
+    for i < m.exports.len {
+        b.append("export ")
+        b.append(m.exports.get(i))
+        b.append("\n")
+        i = i + 1
+    }
+    b.append("hash ")
+    b.append(sum)
+    b.append("\n")
+    val out = text.copy_str(b.str())
+    b.free()
+    return out, true
+}
+
+private fn hash_collected(c: *Collected): str with (a: mem.Allocator) {
+    var files: list.List<hash.File>
+    var i: usize = 0
+    for i < c.names.len {
+        var f: hash.File
+        f.name = c.names.get(i)
+        f.data = c.data.get(i)
+        files.push(f)
+        i = i + 1
+    }
+    val sum = hash.content_hash(files.slice_view())
+    files.free()
+    return sum
+}
+
+private fn take_rewritten(c: *Collected, body: str): bool with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < c.names.len {
+        if c.names.get(i) == "jog.mod" {
+            val old = c.data.get(i)
+            if old.len > 0 {
+                a.free(old)
+            }
+            c.data.set(i, as_bytes(body))
+            return true
+        }
+        i = i + 1
+    }
+    io.eprintln("jog-build pack: collected tree has no jog.mod")
+    return false
+}
+
+private fn src_name(rel: str): str with (a: mem.Allocator) {
+    var b = strbuilder.empty()
+    b.append("src/")
+    b.append(rel)
+    val out = text.copy_str(b.str())
+    b.free()
+    return out
+}
+
+private fn output_path(root_dir: str, output: str, m: manifest.Manifest): str with (a: mem.Allocator) {
+    if output.len > 0 {
+        return text.copy_str(output)
+    }
+    val ver = manifest.version_text(m.version)
+    var b = strbuilder.empty()
+    b.append(m.module)
+    b.append("-")
+    b.append(ver)
+    b.append(".jogz")
+    text.free_str(ver)
+    val file = text.copy_str(b.str())
+    b.free()
+    val out_dir = fs.join(root_dir, "out")
+    ensure_dir(out_dir)
+    val path = fs.join(out_dir, file)
+    fs.free_str(out_dir)
+    text.free_str(file)
+    return path
+}
+
+// Returns the archive path and the content hash. output is the -o path,
+// or empty to write out/<name>-<version>.jogz next to jog.mod.
+fn pack(root_dir: str, output: str, g: resolve.Graph): (str, str, bool) with (a: mem.Allocator) {
+    var (c, cok) = collect(root_dir)
+    if !cok {
+        free_collected(&c)
+        return "", "", false
+    }
+    val mod_path = fs.join(root_dir, "jog.mod")
+    var (mod_bytes, mok) = fs.read_all(mod_path)
+    fs.free_str(mod_path)
+    if !mok {
+        io.eprintln("jog-build pack: cannot read jog.mod")
+        free_collected(&c)
+        return "", "", false
+    }
+    val mod_src: str = mod_bytes
+    var (rewritten, rok) = rewrite_jog_mod(mod_src, g)
+    a.free(mod_bytes)
+    if !rok {
+        text.free_str(rewritten)
+        free_collected(&c)
+        return "", "", false
+    }
+    if !take_rewritten(&c, rewritten) {
+        text.free_str(rewritten)
+        free_collected(&c)
+        return "", "", false
+    }
+    val sum = hash_collected(&c)
+    var (man, aok) = archive_manifest(g.root, g, sum)
+    if !aok {
+        text.free_str(man)
+        text.free_str(sum)
+        free_collected(&c)
+        return "", "", false
+    }
+    var names: list.List<str>
+    var ents: list.List<zip.Entry>
+    var first: zip.Entry
+    first.name = "manifest"
+    first.data = as_bytes(man)
+    ents.push(first)
+    var i: usize = 0
+    for i < c.names.len {
+        val ename = src_name(c.names.get(i))
+        names.push(ename)
+        var e: zip.Entry
+        e.name = ename
+        e.data = c.data.get(i)
+        ents.push(e)
+        i = i + 1
+    }
+    val arc = zip.write(ents.slice_view())
+    val path = output_path(root_dir, output, g.root)
+    val parent = parent_of(path)
+    if parent.len > 0 {
+        ensure_dir(parent)
+    }
+    val wrote = fs.write_all(path, arc)
+    a.free(arc)
+    var k: usize = 0
+    for k < names.len {
+        text.free_str(names.get(k))
+        k = k + 1
+    }
+    names.free()
+    ents.free()
+    text.free_str(man)
+    free_collected(&c)
+    if !wrote {
+        io.eprint("jog-build pack: cannot write ")
+        io.eprintln(path)
+        text.free_str(path)
+        text.free_str(sum)
+        return "", "", false
+    }
+    return path, sum, true
+}
