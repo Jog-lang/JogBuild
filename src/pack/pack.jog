@@ -161,7 +161,7 @@ private fn walk(dir: str, prefix: str, c: *Collected): bool with (a: mem.Allocat
             break
         }
         val name = names.get(i)
-        if text.starts_with(name, ".") || name == "jog.lock" || text.ends_with(name, ".test.jog") {
+        if name.starts_with(".") || name == "jog.lock" || name.ends_with(".test.jog") {
             i = i + 1
             continue
         }
@@ -225,7 +225,7 @@ private fn is_require_line(line: str): bool {
         return false
     }
     val rest = text.slice(line, i, line.len)
-    if !text.starts_with(rest, "require") {
+    if !rest.starts_with("require") {
         return false
     }
     if rest.len == 7 {

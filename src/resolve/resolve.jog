@@ -682,7 +682,7 @@ private fn *Walk.visit_version(req: manifest.Require, parent: list.List<str>): b
 }
 
 private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<str>): bool with (a: mem.Allocator) {
-    if text.ends_with(req.spec, ".jogz") {
+    if req.spec.ends_with(".jogz") {
         return self.visit_archive(req, from_dir, parent)
     }
     if !req.is_path {

@@ -104,7 +104,7 @@ fn parse_flags(command: str, args: []str): (Flags, bool) {
             f.rest = (i + 1) as i64
             return f, true
         }
-        if text.starts_with(arg, "--") {
+        if arg.starts_with("--") {
             var (ok, next) = apply_long(command, &f, arg, args, i)
             if !ok {
                 return f, false
@@ -112,7 +112,7 @@ fn parse_flags(command: str, args: []str): (Flags, bool) {
             i = next
             continue
         }
-        if text.starts_with(arg, "-") && arg.len > 1 {
+        if arg.starts_with("-") && arg.len > 1 {
             var (ok, next) = apply_short(command, &f, arg, args, i)
             if !ok {
                 return f, false
@@ -176,7 +176,7 @@ private fn apply_long(command: str, f: *Flags, arg: str, args: []str, i: usize):
         f.flags_only = true
         return true, i + 1
     }
-    if arg == "--target" || text.starts_with(arg, "--target=") {
+    if arg == "--target" || arg.starts_with("--target=") {
         if command != "build" && command != "run" {
             return false, 0
         }
@@ -185,7 +185,7 @@ private fn apply_long(command: str, f: *Flags, arg: str, args: []str, i: usize):
         }
         var value: str = ""
         var next = i + 1
-        if text.starts_with(arg, "--target=") {
+        if arg.starts_with("--target=") {
             value = text.slice(arg, 9, arg.len)
         } else {
             if i + 1 >= args.len {

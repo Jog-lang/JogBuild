@@ -109,7 +109,7 @@ private fn line_words(line: str): list.List<str> with (a: mem.Allocator) {
 }
 
 private fn hash_ok(sum: str): bool {
-    if !text.starts_with(sum, "sha256:") || sum.len != 71 {
+    if !sum.starts_with("sha256:") || sum.len != 71 {
         return false
     }
     var i: usize = 7
@@ -591,7 +591,7 @@ fn install(root: str, jogz_path: str): (ArchiveManifest, error?) with (a: mem.Al
             break
         }
         val e = entries.get(i)
-        if text.starts_with(e.name, "src/") && e.name.len > 4 {
+        if e.name.starts_with("src/") && e.name.len > 4 {
             wrote = write_rel(tmp, e.name, e.data)
         }
         i = i + 1

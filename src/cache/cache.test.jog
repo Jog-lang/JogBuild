@@ -111,7 +111,7 @@ private fn collect(dir: str, prefix: str, files: *list.List<hash.File>): bool wi
             break
         }
         val name = names.get(i)
-        if text.starts_with(name, ".") || name == "jog.lock" || text.ends_with(name, ".test.jog") {
+        if name.starts_with(".") || name == "jog.lock" || name.ends_with(".test.jog") {
             i = i + 1
             continue
         }

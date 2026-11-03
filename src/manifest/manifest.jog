@@ -518,7 +518,7 @@ private fn base_before_dot(word: str): str {
 }
 
 private fn has_dot(word: str): bool {
-    val (at, found) = text.index_of(word, ".")
+    val (at, found) = word.index_of(".")
     if !found {
         return false
     }
@@ -537,7 +537,7 @@ private fn is_link_word(word: str): bool {
     if word == "link" {
         return true
     }
-    return text.starts_with(word, "link.") && word.len > 5
+    return word.starts_with("link.") && word.len > 5
 }
 
 private fn dup_require(m: *Manifest, name: str): bool {
@@ -756,7 +756,7 @@ private fn apply_export(m: *Manifest, words: list.List<Word>, line_no: i64, st: 
         return false
     }
     val path = words.get(1)
-    if !is_dotted_path(path.text) || path.text == "std" || text.starts_with(path.text, "std.") {
+    if !is_dotted_path(path.text) || path.text == "std" || path.text.starts_with("std.") {
         return fail(err, line_no, path.col, with_word("jog.mod: export '", path.text, "' is not a package path of this module"))
     }
     if dup_export(m, path.text) {

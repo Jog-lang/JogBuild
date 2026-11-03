@@ -61,7 +61,7 @@ fn read_int(text: str, start: usize): (i64, usize, bool) {
 }
 
 fn parse_expect(line: str): (i64, i64, str, bool) {
-    if !text.starts_with(line, "jog.mod:") {
+    if !line.starts_with("jog.mod:") {
         return 0, 0, "", false
     }
     var (line_no, at, lok) = read_int(line, 8)
@@ -75,7 +75,7 @@ fn parse_expect(line: str): (i64, i64, str, bool) {
         return 0, 0, "", false
     }
     val rest = text.slice(line, at, line.len)
-    if !text.starts_with(rest, ": error: ") {
+    if !rest.starts_with(": error: ") {
         return 0, 0, "", false
     }
     return line_no, col, text.slice(rest, 9, rest.len), true
@@ -186,7 +186,7 @@ fn check_valid(dir: str) with (t: testing.Testing, a: mem.Allocator) {
     var i: usize = 0
     for i < names.len {
         val name = names.get(i)
-        if text.ends_with(name, ".mod") {
+        if name.ends_with(".mod") {
             val path = fs.join(dir, name)
             var (data, err) = fs.read_all(path)
             if err != null {
