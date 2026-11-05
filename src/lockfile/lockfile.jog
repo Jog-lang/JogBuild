@@ -26,6 +26,7 @@ struct Entry {
     source: str
     location: str
     hash: str
+    is_test: bool
 }
 
 private fn as_bytes(s: str): bytes {
@@ -106,7 +107,8 @@ fn free_entries(xs: *list.List<Entry>) with (a: mem.Allocator) {
 }
 
 fn entries(g: resolve.Graph): list.List<Entry> with (a: mem.Allocator) {
-    var xs: list.List<Entry>
+    var prod: list.List<Entry>
+    var tests: list.List<Entry>
     var i: usize = 0
     for i < g.nodes.len {
         val n = g.nodes.get(i)
@@ -125,41 +127,76 @@ fn entries(g: resolve.Graph): list.List<Entry> with (a: mem.Allocator) {
         } else {
             e.hash = fs.copy_str(n.hash)
         }
-        xs.push(e)
+        e.is_test = n.is_test
+        if n.is_test {
+            tests.push(e)
+        } else {
+            prod.push(e)
+        }
         i = i + 1
     }
-    sort_entries(&xs)
+    sort_entries(&prod)
+    sort_entries(&tests)
+    var xs: list.List<Entry>
+    i = 0
+    for i < prod.len {
+        xs.push(prod.get(i))
+        i = i + 1
+    }
+    prod.free()
+    i = 0
+    for i < tests.len {
+        xs.push(tests.get(i))
+        i = i + 1
+    }
+    tests.free()
     return xs
 }
 
+private fn append_dep_line(b: *strbuilder.StrBuilder, e: Entry, kind: str) {
+    b.append(kind)
+    b.append(" ")
+    b.append(e.module)
+    b.append(" ")
+    b.append(e.version)
+    b.append(" ")
+    b.append(e.source)
+    b.append(" ")
+    b.append(e.location)
+    b.append(" ")
+    b.append(e.hash)
+    b.append("\n")
+}
+
 fn format(items: []Entry): str with (a: mem.Allocator) {
-    var xs: list.List<Entry>
+    var prod: list.List<Entry>
+    var tests: list.List<Entry>
     var i: usize = 0
     for i < items.len {
-        xs.push(items[i])
+        if items[i].is_test {
+            tests.push(items[i])
+        } else {
+            prod.push(items[i])
+        }
         i = i + 1
     }
-    sort_entries(&xs)
+    sort_entries(&prod)
+    sort_entries(&tests)
     var b = strbuilder.empty()
     b.append("# jog.lock: written by jog-build, do not edit\n")
     b.append("lock 1\n")
     i = 0
-    for i < xs.len {
-        val e = xs.get(i)
-        b.append("dep ")
-        b.append(e.module)
-        b.append(" ")
-        b.append(e.version)
-        b.append(" ")
-        b.append(e.source)
-        b.append(" ")
-        b.append(e.location)
-        b.append(" ")
-        b.append(e.hash)
-        b.append("\n")
+    for i < prod.len {
+        append_dep_line(&b, prod.get(i), "dep")
         i = i + 1
     }
-    xs.free()
+    i = 0
+    for i < tests.len {
+        append_dep_line(&b, tests.get(i), "dep.test")
+        i = i + 1
+    }
+    prod.free()
+    tests.free()
     val out = fs.copy_str(b.str())
     b.free()
     return out
@@ -252,7 +289,7 @@ fn parse(src: str): (list.List<Entry>, bool) with (a: mem.Allocator) {
             } else {
                 saw_lock = true
             }
-        } else if head == "dep" {
+        } else if head == "dep" || head == "dep.test" {
             if !saw_lock || words.len != 6 {
                 bad_line = true
             } else {
@@ -262,6 +299,7 @@ fn parse(src: str): (list.List<Entry>, bool) with (a: mem.Allocator) {
                 e.source = fs.copy_str(words.get(3))
                 e.location = fs.copy_str(words.get(4))
                 e.hash = fs.copy_str(words.get(5))
+                e.is_test = head == "dep.test"
                 xs.push(e)
             }
         } else {

@@ -95,11 +95,19 @@ fn module_arg(name: str, dir: str): str with (a: mem.Allocator) {
     return text
 }
 
-fn module_flags(g: resolve.Graph): list.List<str> with (a: mem.Allocator) {
+/**
+ * --module pairs for the compiler. When include_test is false, skips
+ * nodes that were required only via require.test.
+ */
+fn module_flags(g: resolve.Graph, include_test: bool): list.List<str> with (a: mem.Allocator) {
     var flags: list.List<str>
     var i: usize = 0
     for i < g.nodes.len {
         val n = g.nodes.get(i)
+        if !include_test && n.is_test {
+            i = i + 1
+            continue
+        }
         flags.push("--module")
         flags.push(module_arg(n.name, n.dir))
         i = i + 1
@@ -107,7 +115,101 @@ fn module_flags(g: resolve.Graph): list.List<str> with (a: mem.Allocator) {
     return flags
 }
 
-// flags is the --module pairs. extra is the remaining jog flags.
+private fn libdir_applies(target: str, host_os: str, wasm: bool): bool {
+    if target.len == 0 {
+        return true
+    }
+    if wasm {
+        return false
+    }
+    return target == host_os
+}
+
+private fn push_libdirs(flags: *list.List<str>, dirs: list.List<manifest.Libdir>, base_dir: str, host_os: str, wasm: bool) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < dirs.len {
+        val d = dirs.get(i)
+        if libdir_applies(d.target, host_os, wasm) {
+            flags.push("--libdir")
+            flags.push(resolve.absolute(base_dir, d.path))
+        }
+        i = i + 1
+    }
+}
+
+private fn split_env_libdirs(src: str): list.List<str> with (a: mem.Allocator) {
+    return split(src, host.path_sep())
+}
+
+/**
+ * Merged --libdir pairs: root jog.mod, each mapped module (respecting
+ * include_test), optional jog.local.mod next to the root, JOG_LIBDIRS,
+ * then CLI --libdir values. Relative paths are resolved against the
+ * owning module directory (or left as given for CLI/env absolutes).
+ */
+fn libdir_flags(g: resolve.Graph, include_test: bool, cli_dirs: []str, wasm_target: bool): list.List<str> with (a: mem.Allocator) {
+    var flags: list.List<str>
+    val host_os = host.os_name()
+    push_libdirs(&flags, g.root.libdirs, g.root_dir, host_os, wasm_target)
+    var i: usize = 0
+    for i < g.nodes.len {
+        val n = g.nodes.get(i)
+        if !include_test && n.is_test {
+            i = i + 1
+            continue
+        }
+        push_libdirs(&flags, n.libdirs, n.dir, host_os, wasm_target)
+        i = i + 1
+    }
+    val local_path = fs.join(g.root_dir, "jog.local.mod")
+    var (local_data, local_err) = fs.read_all(local_path)
+    if local_err == null {
+        val body: str = local_data
+        var (dirs, err, ok) = manifest.parse_local_overlay(body)
+        a.free(local_data)
+        if ok {
+            push_libdirs(&flags, dirs, g.root_dir, host_os, wasm_target)
+            manifest.free_libdirs(&dirs)
+        } else {
+            var b = strbuilder.empty()
+            b.append(local_path)
+            b.append(":")
+            b.append_int(err.pos.line, 10)
+            b.append(":")
+            b.append_int(err.pos.col, 10)
+            b.append(": error: ")
+            b.append(err.message)
+            io.eprintln(b.str())
+            b.free()
+            manifest.free_libdirs(&dirs)
+        }
+    }
+    fs.free_str(local_path)
+    var (env_val, env_ok) = os.env("JOG_LIBDIRS")
+    if env_ok && env_val.len > 0 {
+        var parts = split_env_libdirs(env_val)
+        var p: usize = 0
+        for p < parts.len {
+            if parts.get(p).len > 0 {
+                flags.push("--libdir")
+                flags.push(fs.copy_str(parts.get(p)))
+            }
+            p = p + 1
+        }
+        parts.free()
+    }
+    i = 0
+    for i < cli_dirs.len {
+        if cli_dirs[i].len > 0 {
+            flags.push("--libdir")
+            flags.push(fs.copy_str(cli_dirs[i]))
+        }
+        i = i + 1
+    }
+    return flags
+}
+
+// flags is the --module / --libdir pairs. extra is the remaining jog flags.
 fn command(jog: str, sub: str, root: str, flags: []str, extra: []str): list.List<str> with (a: mem.Allocator) {
     var argv: list.List<str>
     argv.push(jog)

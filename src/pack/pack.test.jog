@@ -61,7 +61,7 @@ fn pack_top_matches_fixtures() with (t: testing.Testing) {
     with (&ar) {
         val root = repo_root()
         val top = fs.join(root, "testdata/pack/top")
-        var (g, err) = resolve.resolve(top, jog_ver())
+        var (g, err) = resolve.resolve(top, jog_ver(), true)
         t.expect(err == null)
         val dest = fs.join(root, "out/test-pack/top.jogz")
         var (path, sum, pok) = pack(top, dest, g)

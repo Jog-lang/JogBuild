@@ -36,6 +36,11 @@ struct Link {
     target: str
 }
 
+struct Libdir {
+    path: str
+    target: str
+}
+
 struct Manifest {
     module: str
     version: Version
@@ -49,8 +54,10 @@ struct Manifest {
     jog_line: i64
     jog_col: i64
     requires: list.List<Require>
+    test_requires: list.List<Require>
     exports: list.List<str>
     links: list.List<Link>
+    libdirs: list.List<Libdir>
     has_targets: bool
     targets: list.List<str>
 }
@@ -395,6 +402,12 @@ private fn free_version(v: *Version) with (a: mem.Allocator) {
     fs.free_str(v.pre)
 }
 
+private fn free_require(r: *Require) with (a: mem.Allocator) {
+    fs.free_str(r.module)
+    fs.free_str(r.spec)
+    free_version(&r.version)
+}
+
 fn free(m: *Manifest) with (a: mem.Allocator) {
     fs.free_str(m.module)
     free_version(&m.version)
@@ -402,12 +415,17 @@ fn free(m: *Manifest) with (a: mem.Allocator) {
     var i: usize = 0
     for i < m.requires.len {
         var r = m.requires.get(i)
-        fs.free_str(r.module)
-        fs.free_str(r.spec)
-        free_version(&r.version)
+        free_require(&r)
         i = i + 1
     }
     m.requires.free()
+    i = 0
+    for i < m.test_requires.len {
+        var r = m.test_requires.get(i)
+        free_require(&r)
+        i = i + 1
+    }
+    m.test_requires.free()
     i = 0
     for i < m.exports.len {
         fs.free_str(m.exports.get(i))
@@ -422,6 +440,14 @@ fn free(m: *Manifest) with (a: mem.Allocator) {
         i = i + 1
     }
     m.links.free()
+    i = 0
+    for i < m.libdirs.len {
+        var d = m.libdirs.get(i)
+        fs.free_str(d.path)
+        fs.free_str(d.target)
+        i = i + 1
+    }
+    m.libdirs.free()
     i = 0
     for i < m.targets.len {
         fs.free_str(m.targets.get(i))
@@ -490,7 +516,7 @@ private fn name_eq(words: list.List<Word>, i: usize, literal: str): bool {
 }
 
 private fn reserved_base(word: str): bool {
-    if word == "libdir" || word == "source" || word == "replace" || word == "config" {
+    if word == "source" || word == "replace" || word == "config" {
         return true
     }
     if word == "include" || word == "exclude" || word == "provides" || word == "needs" {
@@ -503,7 +529,10 @@ private fn known_base(word: str): bool {
     if word == "module" || word == "version" || word == "kind" || word == "jog" {
         return true
     }
-    return word == "require" || word == "export" || word == "link"
+    if word == "require" || word == "export" || word == "link" || word == "libdir" {
+        return true
+    }
+    return false
 }
 
 private fn base_before_dot(word: str): str {
@@ -540,10 +569,28 @@ private fn is_link_word(word: str): bool {
     return word.starts_with("link.") && word.len > 5
 }
 
+private fn is_libdir_word(word: str): bool {
+    if word == "libdir" {
+        return true
+    }
+    return word.starts_with("libdir.") && word.len > 7
+}
+
 private fn dup_require(m: *Manifest, name: str): bool {
     var i: usize = 0
     for i < m.requires.len {
         if m.requires.get(i).module == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+private fn dup_test_require(m: *Manifest, name: str): bool {
+    var i: usize = 0
+    for i < m.test_requires.len {
+        if m.test_requires.get(i).module == name {
             return true
         }
         i = i + 1
@@ -567,7 +614,10 @@ private fn apply_module(m: *Manifest, words: list.List<Word>, line_no: i64, st: 
     if st.saw_module {
         return fail(err, line_no, pos, "jog.mod: duplicate module declaration")
     }
-    if st.saw_version || st.saw_kind || st.saw_jog || m.requires.len > 0 || m.exports.len > 0 || m.links.len > 0 {
+    if st.saw_version || st.saw_kind || st.saw_jog {
+        return fail(err, line_no, pos, "jog.mod: module name must be the first declaration")
+    }
+    if m.requires.len > 0 || m.test_requires.len > 0 || m.exports.len > 0 || m.links.len > 0 || m.libdirs.len > 0 {
         return fail(err, line_no, pos, "jog.mod: module name must be the first declaration")
     }
     if words.len < 2 {
@@ -608,6 +658,26 @@ private fn apply_link(m: *Manifest, words: list.List<Word>, line_no: i64, err: *
     link.lib = fs.copy_str(words.get(1).text)
     link.target = fs.copy_str(target)
     m.links.push(link)
+    return true
+}
+
+private fn apply_libdir(m: *Manifest, words: list.List<Word>, line_no: i64, err: *ParseError): bool with (a: mem.Allocator) {
+    val first = words.get(0)
+    var target: str = ""
+    if first.text != "libdir" {
+        val tcol = first.col + 7
+        target = text.slice(first.text, 7, first.text.len)
+        if target != "windows" && target != "linux" && target != "macos" {
+            return fail(err, line_no, tcol, with_word("jog.mod: unknown target '", target, "'; expected windows, linux, or macos"))
+        }
+    }
+    if !one_word(words, "jog.mod: missing library search path", "jog.mod: extra tokens after the library search path", err, line_no) {
+        return false
+    }
+    var d: Libdir
+    d.path = fs.copy_str(words.get(1).text)
+    d.target = fs.copy_str(target)
+    m.libdirs.push(d)
     return true
 }
 
@@ -707,7 +777,7 @@ private fn apply_jog(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Sc
     return true
 }
 
-private fn apply_require(m: *Manifest, words: list.List<Word>, line_no: i64, err: *ParseError): bool with (a: mem.Allocator) {
+private fn parse_require_words(m: *Manifest, words: list.List<Word>, line_no: i64, err: *ParseError, for_test: bool): bool with (a: mem.Allocator) {
     if words.len < 2 {
         return fail(err, line_no, words.get(0).col, "jog.mod: missing module name")
     }
@@ -727,7 +797,11 @@ private fn apply_require(m: *Manifest, words: list.List<Word>, line_no: i64, err
     if name.text == m.module {
         return fail(err, line_no, name.col, with_word("jog.mod: module '", m.module, "' cannot require itself"))
     }
-    if dup_require(m, name.text) {
+    if for_test {
+        if dup_test_require(m, name.text) {
+            return fail(err, line_no, name.col, with_word("jog.mod: module '", name.text, "' is required twice"))
+        }
+    } else if dup_require(m, name.text) {
         return fail(err, line_no, name.col, with_word("jog.mod: module '", name.text, "' is required twice"))
     }
     val spec = words.get(2)
@@ -747,8 +821,20 @@ private fn apply_require(m: *Manifest, words: list.List<Word>, line_no: i64, err
     req.version = ver
     req.pos.line = line_no
     req.pos.col = name.col
-    m.requires.push(req)
+    if for_test {
+        m.test_requires.push(req)
+    } else {
+        m.requires.push(req)
+    }
     return true
+}
+
+private fn apply_require(m: *Manifest, words: list.List<Word>, line_no: i64, err: *ParseError): bool with (a: mem.Allocator) {
+    return parse_require_words(m, words, line_no, err, false)
+}
+
+private fn apply_require_test(m: *Manifest, words: list.List<Word>, line_no: i64, err: *ParseError): bool with (a: mem.Allocator) {
+    return parse_require_words(m, words, line_no, err, true)
 }
 
 private fn apply_export(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, err: *ParseError): bool with (a: mem.Allocator) {
@@ -790,6 +876,9 @@ private fn apply(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, 
     if is_link_word(first) {
         return apply_link(m, words, line_no, err)
     }
+    if is_libdir_word(first) {
+        return apply_libdir(m, words, line_no, err)
+    }
     if first == "targets" {
         return apply_targets(m, words, line_no, st, err)
     }
@@ -804,6 +893,9 @@ private fn apply(m: *Manifest, words: list.List<Word>, line_no: i64, st: *Scan, 
     }
     if first == "require" {
         return apply_require(m, words, line_no, err)
+    }
+    if first == "require.test" {
+        return apply_require_test(m, words, line_no, err)
     }
     if first == "export" {
         return apply_export(m, words, line_no, st, err)
@@ -871,6 +963,96 @@ private fn err_simple(line: i64, col: i64, message: str): ParseError {
     return err
 }
 
+/**
+ * Parse a gitignored jog.local.mod: only libdir / libdir.<target> lines.
+ * No module line is required. Other directives are errors.
+ * @param src file text
+ * @context a allocator for the libdir strings
+ * @return the libdirs, a parse error, and whether the file parsed
+ */
+fn parse_local_overlay(src: str): (list.List<Libdir>, ParseError, bool) with (a: mem.Allocator) {
+    var dirs: list.List<Libdir>
+    var err: ParseError
+    var at: usize = 0
+    var line_no: i64 = 1
+    for at < src.len {
+        val line_start = at
+        for at < src.len && src.ptr[at] != '\n' as u8 && src.ptr[at] != '\r' as u8 {
+            at = at + 1
+        }
+        val line = text.slice(src, line_start, at)
+        if at < src.len && src.ptr[at] == '\r' as u8 {
+            at = at + 1
+        }
+        if at < src.len && src.ptr[at] == '\n' as u8 {
+            at = at + 1
+        }
+        var words = tokenize(line)
+        if words.len == 0 {
+            words.free()
+            line_no = line_no + 1
+            continue
+        }
+        var i: usize = 0
+        var quoted = false
+        for i < words.len {
+            val w = words.get(i)
+            if w.text.len > 0 && w.text.ptr[0] == '"' as u8 {
+                quoted = true
+                err.pos.line = line_no
+                err.pos.col = w.col
+                err.message = "jog.mod: quoted words are reserved for a later version"
+                break
+            }
+            i = i + 1
+        }
+        if quoted {
+            words.free()
+            free_libdirs(&dirs)
+            var empty: list.List<Libdir>
+            return empty, err, false
+        }
+        val first = words.get(0).text
+        if !is_libdir_word(first) {
+            err.pos.line = line_no
+            err.pos.col = words.get(0).col
+            err.message = with_word("jog.local.mod: only libdir lines are allowed; got '", first, "'")
+            words.free()
+            free_libdirs(&dirs)
+            var empty: list.List<Libdir>
+            return empty, err, false
+        }
+        var m: Manifest
+        val ok = apply_libdir(&m, words, line_no, &err)
+        words.free()
+        if !ok {
+            free_libdirs(&dirs)
+            free(&m)
+            var empty: list.List<Libdir>
+            return empty, err, false
+        }
+        var k: usize = 0
+        for k < m.libdirs.len {
+            dirs.push(m.libdirs.get(k))
+            k = k + 1
+        }
+        m.libdirs.free()
+        line_no = line_no + 1
+    }
+    return dirs, err, true
+}
+
+fn free_libdirs(dirs: *list.List<Libdir>) with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < dirs.len {
+        var d = dirs.get(i)
+        fs.free_str(d.path)
+        fs.free_str(d.target)
+        i = i + 1
+    }
+    dirs.free()
+}
+
 fn format(m: Manifest): str with (a: mem.Allocator) {
     var b = strbuilder.empty()
     b.append("module ")
@@ -904,6 +1086,16 @@ fn format(m: Manifest): str with (a: mem.Allocator) {
         i = i + 1
     }
     i = 0
+    for i < m.test_requires.len {
+        val r = m.test_requires.get(i)
+        b.append("require.test ")
+        b.append(r.module)
+        b.append(" ")
+        b.append(r.spec)
+        b.append("\n")
+        i = i + 1
+    }
+    i = 0
     for i < m.exports.len {
         b.append("export ")
         b.append(m.exports.get(i))
@@ -920,6 +1112,19 @@ fn format(m: Manifest): str with (a: mem.Allocator) {
         }
         b.append(" ")
         b.append(link.lib)
+        b.append("\n")
+        i = i + 1
+    }
+    i = 0
+    for i < m.libdirs.len {
+        val d = m.libdirs.get(i)
+        b.append("libdir")
+        if d.target.len > 0 {
+            b.append(".")
+            b.append(d.target)
+        }
+        b.append(" ")
+        b.append(d.path)
         b.append("\n")
         i = i + 1
     }

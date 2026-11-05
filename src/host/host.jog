@@ -23,6 +23,12 @@ expect fn compiler_file(): str
 expect fn windows(): bool
 
 /**
+ * The host OS name used for link.<target> and libdir.<target>.
+ * @return "windows", "linux", or "macos"
+ */
+expect fn os_name(): str
+
+/**
  * True when two paths that differ only in case name the same folder.
  * @return true on Windows
  */
