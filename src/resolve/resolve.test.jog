@@ -80,7 +80,7 @@ fn missing_version_message() with (t: testing.Testing) {
 
 fn resolves(folder: str): bool with (a: mem.Allocator) {
     val app = app_dir(folder)
-    var (g, err) = resolve(app, jog_ver())
+    var (g, err) = resolve(app, jog_ver(), false)
     return err == null
 }
 
@@ -89,7 +89,7 @@ fn diamond_orders_c_first() with (t: testing.Testing) {
     var ar = arena.init(0)
     with (&ar) {
         val app = app_dir("diamond")
-        var (g, err) = resolve(app, jog_ver())
+        var (g, err) = resolve(app, jog_ver(), false)
         t.expect(err == null)
         t.expect(g.nodes.len == 3)
         if g.nodes.len == 3 {
@@ -185,6 +185,26 @@ fn notcached_fails() with (t: testing.Testing) {
     var ar = arena.init(0)
     with (&ar) {
         t.expect(!resolves("notcached"))
+    }
+    ar.release()
+}
+
+@test
+fn require_test_is_optional() with (t: testing.Testing) {
+    var ar = arena.init(0)
+    with (&ar) {
+        val root = repo_root()
+        val app = fs.join(root, "testdata/require-test/app")
+        var (prod, perr) = resolve(app, jog_ver(), false)
+        t.expect(perr == null)
+        t.expect(prod.nodes.len == 0)
+        var (with_test, terr) = resolve(app, jog_ver(), true)
+        t.expect(terr == null)
+        t.expect(with_test.nodes.len == 1)
+        if with_test.nodes.len == 1 {
+            t.expect(with_test.nodes.get(0).name == "mock_fs")
+            t.expect(with_test.nodes.get(0).is_test)
+        }
     }
     ar.release()
 }

@@ -1,0 +1,7 @@
+import mock_fs
+import std.testing
+
+@test
+fn uses_mock() with (t: testing.Testing) {
+    t.expect(mock_fs.ready())
+}

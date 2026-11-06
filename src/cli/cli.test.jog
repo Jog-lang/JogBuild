@@ -80,12 +80,38 @@ fn deps_flags_sets_flags_only() with (t: testing.Testing) {
         var (f, ok) = parse_flags("deps", args.slice_view())
         t.expect(ok)
         t.expect(f.flags_only)
+        t.expect(!f.include_test)
         args.free()
         var bare: list.List<str>
         var (g, gok) = parse_flags("deps", bare.slice_view())
         t.expect(gok)
         t.expect(!g.flags_only)
         bare.free()
+        var with_test: list.List<str>
+        with_test.push("--flags")
+        with_test.push("--test")
+        var (h, hok) = parse_flags("deps", with_test.slice_view())
+        t.expect(hok)
+        t.expect(h.flags_only)
+        t.expect(h.include_test)
+        with_test.free()
+    }
+}
+
+@test
+fn build_accepts_libdir() with (t: testing.Testing) {
+    with (mem.heap()) {
+        var args: list.List<str>
+        args.push("--libdir")
+        args.push("/opt/lib")
+        args.push("--libdir=/usr/local/lib")
+        var (f, ok) = parse_flags("build", args.slice_view())
+        t.expect(ok)
+        collect_libdirs(&f, args.slice_view())
+        t.expect(f.libdirs.len == 2)
+        t.expect(f.libdirs.get(0) == "/opt/lib")
+        t.expect(f.libdirs.get(1) == "/usr/local/lib")
+        args.free()
     }
 }
 

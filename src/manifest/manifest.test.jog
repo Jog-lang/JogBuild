@@ -88,6 +88,16 @@ fn version_eq(a: Version, b: Version): bool {
     return a.pre == b.pre
 }
 
+fn require_eq(x: Require, y: Require): bool {
+    if x.module != y.module || x.spec != y.spec || x.is_path != y.is_path {
+        return false
+    }
+    if !x.is_path && !version_eq(x.version, y.version) {
+        return false
+    }
+    return true
+}
+
 fn same(a: Manifest, b: Manifest): bool {
     if a.module != b.module || a.has_version != b.has_version || a.has_kind != b.has_kind {
         return false
@@ -98,7 +108,10 @@ fn same(a: Manifest, b: Manifest): bool {
     if !version_eq(a.version, b.version) || !version_eq(a.jog, b.jog) {
         return false
     }
-    if a.requires.len != b.requires.len || a.exports.len != b.exports.len || a.links.len != b.links.len {
+    if a.requires.len != b.requires.len || a.test_requires.len != b.test_requires.len {
+        return false
+    }
+    if a.exports.len != b.exports.len || a.links.len != b.links.len || a.libdirs.len != b.libdirs.len {
         return false
     }
     if a.targets.len != b.targets.len {
@@ -106,12 +119,14 @@ fn same(a: Manifest, b: Manifest): bool {
     }
     var i: usize = 0
     for i < a.requires.len {
-        val x = a.requires.get(i)
-        val y = b.requires.get(i)
-        if x.module != y.module || x.spec != y.spec || x.is_path != y.is_path {
+        if !require_eq(a.requires.get(i), b.requires.get(i)) {
             return false
         }
-        if !x.is_path && !version_eq(x.version, y.version) {
+        i = i + 1
+    }
+    i = 0
+    for i < a.test_requires.len {
+        if !require_eq(a.test_requires.get(i), b.test_requires.get(i)) {
             return false
         }
         i = i + 1
@@ -128,6 +143,15 @@ fn same(a: Manifest, b: Manifest): bool {
         val x = a.links.get(i)
         val y = b.links.get(i)
         if x.lib != y.lib || x.target != y.target {
+            return false
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < a.libdirs.len {
+        val x = a.libdirs.get(i)
+        val y = b.libdirs.get(i)
+        if x.path != y.path || x.target != y.target {
             return false
         }
         i = i + 1
@@ -164,6 +188,21 @@ fn spot(m: Manifest, name: str) with (t: testing.Testing) {
         t.expect(m.links.get(0).target == "windows")
         t.expect(m.links.get(1).target == "linux")
         t.expect(m.links.get(2).target == "macos")
+    }
+    if name == "libdir.mod" {
+        t.expect(m.libdirs.len == 4)
+        t.expect(m.libdirs.get(0).path == "./vendor/lib")
+        t.expect(m.libdirs.get(0).target.len == 0)
+        t.expect(m.libdirs.get(1).target == "linux")
+        t.expect(m.libdirs.get(1).path == "./prefix/lib64")
+        t.expect(m.libdirs.get(2).target == "macos")
+        t.expect(m.libdirs.get(3).target == "windows")
+        t.expect(m.test_requires.len == 1)
+        t.expect(m.test_requires.get(0).module == "mock_fs")
+        t.expect(m.test_requires.get(0).spec == "./mocks/mock_fs")
+        t.expect(m.test_requires.get(0).is_path)
+        t.expect(m.requires.len == 1)
+        t.expect(m.requires.get(0).module == "mathx")
     }
     if name == "targets.mod" {
         t.expect(m.has_targets)

@@ -211,7 +211,7 @@ fn collect(root_dir: str): (Collected, bool) with (a: mem.Allocator) {
     return c, ok
 }
 
-private fn is_require_line(line: str): bool {
+private fn line_directive_start(line: str): usize {
     var i: usize = 0
     for i < line.len {
         val c = line.ptr[i]
@@ -221,6 +221,11 @@ private fn is_require_line(line: str): bool {
         }
         break
     }
+    return i
+}
+
+private fn is_require_line(line: str): bool {
+    val i = line_directive_start(line)
     if i >= line.len || line.ptr[i] == '#' as u8 {
         return false
     }
@@ -232,6 +237,23 @@ private fn is_require_line(line: str): bool {
         return true
     }
     val n = rest.ptr[7]
+    return n == ' ' as u8 || n == '\t' as u8
+}
+
+// require.test is not packed into .jogz (Packages.md).
+private fn is_require_test_line(line: str): bool {
+    val i = line_directive_start(line)
+    if i >= line.len || line.ptr[i] == '#' as u8 {
+        return false
+    }
+    val rest = text.slice(line, i, line.len)
+    if !rest.starts_with("require.test") {
+        return false
+    }
+    if rest.len == 12 {
+        return true
+    }
+    val n = rest.ptr[12]
     return n == ' ' as u8 || n == '\t' as u8
 }
 
@@ -277,7 +299,9 @@ fn rewrite_jog_mod(src: str, g: resolve.Graph): (str, bool) with (a: mem.Allocat
         if at < src.len && src.ptr[at] == '\n' as u8 {
             at = at + 1
         }
-        if is_require_line(line) {
+        if is_require_test_line(line) {
+            // Drop test-only requires from the shipped jog.mod.
+        } else if is_require_line(line) {
             if req_i >= g.root.requires.len {
                 failed = true
                 break

@@ -17,6 +17,10 @@ actual fn windows(): bool {
     return true
 }
 
+actual fn os_name(): str {
+    return "windows"
+}
+
 actual fn fold_case(): bool {
     return true
 }

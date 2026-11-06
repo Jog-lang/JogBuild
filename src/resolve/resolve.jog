@@ -35,7 +35,9 @@ struct Node {
     dir: str
     hash: str
     has_version: bool
+    is_test: bool
     requires: list.List<str>
+    libdirs: list.List<manifest.Libdir>
     chain: list.List<str>
 }
 
@@ -59,6 +61,7 @@ private struct Work {
     source: Source
     hash: str
     has_version: bool
+    is_test: bool
 }
 
 private struct Walk {
@@ -349,8 +352,20 @@ private fn append_chain(b: *strbuilder.StrBuilder, names: list.List<str>, versio
     }
 }
 
+// Module names clash case-insensitively on every host (Packages / Plan.md).
+// Folder paths still use same_folder / fold_case for the filesystem.
 private fn names_ci(a: str, b: str): bool {
-    return same_folder(a, b)
+    if a.len != b.len {
+        return false
+    }
+    var i: usize = 0
+    for i < a.len {
+        if fold(a.ptr[i]) != fold(b.ptr[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
 }
 
 private fn *Walk.case_clash(name: str): bool with (a: mem.Allocator) {
@@ -493,7 +508,7 @@ private fn spec_before(left: str, right: str): bool {
     }
 }
 
-private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str>, source: Source, file_hash: str): bool with (a: mem.Allocator) {
+private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str>, source: Source, file_hash: str, is_test: bool): bool with (a: mem.Allocator) {
     var (man, path, status) = read_mod(dir)
     if status == 1 {
         report_missing(req.module, dir)
@@ -543,11 +558,14 @@ private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str
     w.source = source
     w.hash = fs.copy_str(file_hash)
     w.has_version = man.has_version
+    w.is_test = is_test
     val idx = self.works.len
     self.works.push(w)
     val key = self.works.get(idx).name
     self.index.insert(key, map.fnv1a(key), idx)
-    if !self.walk_requires(dir, man, chain) {
+    // Deps of a test-only module stay test-only. Their own require.test
+    // lines are ignored in V1.
+    if !self.walk_requires(dir, man, chain, is_test) {
         return false
     }
     var done = self.works.get(idx)
@@ -557,7 +575,7 @@ private fn *Walk.check_new(dir: str, req: manifest.Require, chain: list.List<str
     return true
 }
 
-private fn *Walk.consider(req: manifest.Require, dir: str, parent: list.List<str>, source: Source, file_hash: str): bool with (a: mem.Allocator) {
+private fn *Walk.consider(req: manifest.Require, dir: str, parent: list.List<str>, source: Source, file_hash: str, is_test: bool): bool with (a: mem.Allocator) {
     var existing: usize = 0
     if self.index.get(req.module, map.fnv1a(req.module), &existing) {
         val w = self.works.get(existing)
@@ -573,6 +591,12 @@ private fn *Walk.consider(req: manifest.Require, dir: str, parent: list.List<str
                 val old_spec = updated.spec
                 updated.spec = fs.copy_str(req.spec)
                 fs.free_str(old_spec)
+                self.works.set(existing, updated)
+            }
+            // A production require wins over a test-only mark for the same folder.
+            if w.is_test && !is_test {
+                var updated = self.works.get(existing)
+                updated.is_test = false
                 self.works.set(existing, updated)
             }
             return true
@@ -608,10 +632,10 @@ private fn *Walk.consider(req: manifest.Require, dir: str, parent: list.List<str
         return false
     }
     val chain = copy_chain(parent, req.module)
-    return self.check_new(dir, req, chain, source, file_hash)
+    return self.check_new(dir, req, chain, source, file_hash, is_test)
 }
 
-private fn *Walk.visit_archive(req: manifest.Require, from_dir: str, parent: list.List<str>): bool with (a: mem.Allocator) {
+private fn *Walk.visit_archive(req: manifest.Require, from_dir: str, parent: list.List<str>, is_test: bool): bool with (a: mem.Allocator) {
     val jogz = absolute(from_dir, req.spec)
     val root = cache.dir()
     if root.len == 0 {
@@ -644,13 +668,13 @@ private fn *Walk.visit_archive(req: manifest.Require, from_dir: str, parent: lis
     cache.free_manifest(&am)
     fs.free_str(ver)
     fs.free_str(root)
-    val ok = self.consider(req, dir, parent, Source.Archive, file_hash)
+    val ok = self.consider(req, dir, parent, Source.Archive, file_hash, is_test)
     fs.free_str(dir)
     fs.free_str(file_hash)
     return ok
 }
 
-private fn *Walk.visit_version(req: manifest.Require, parent: list.List<str>): bool with (a: mem.Allocator) {
+private fn *Walk.visit_version(req: manifest.Require, parent: list.List<str>, is_test: bool): bool with (a: mem.Allocator) {
     val root = cache.dir()
     var present = false
     if root.len > 0 {
@@ -675,34 +699,52 @@ private fn *Walk.visit_version(req: manifest.Require, parent: list.List<str>): b
     val file_hash = fs.copy_str(am.hash)
     cache.free_manifest(&am)
     fs.free_str(root)
-    val ok = self.consider(req, dir, parent, Source.Cache, file_hash)
+    val ok = self.consider(req, dir, parent, Source.Cache, file_hash, is_test)
     fs.free_str(dir)
     fs.free_str(file_hash)
     return ok
 }
 
-private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<str>): bool with (a: mem.Allocator) {
+private fn *Walk.visit(req: manifest.Require, from_dir: str, parent: list.List<str>, is_test: bool): bool with (a: mem.Allocator) {
     if req.spec.ends_with(".jogz") {
-        return self.visit_archive(req, from_dir, parent)
+        return self.visit_archive(req, from_dir, parent, is_test)
     }
     if !req.is_path {
-        return self.visit_version(req, parent)
+        return self.visit_version(req, parent, is_test)
     }
     val dir = absolute(from_dir, req.spec)
-    val ok = self.consider(req, dir, parent, Source.Path, "")
+    val ok = self.consider(req, dir, parent, Source.Path, "", is_test)
     fs.free_str(dir)
     return ok
 }
 
-private fn *Walk.walk_requires(dir: str, man: manifest.Manifest, chain: list.List<str>): bool with (a: mem.Allocator) {
+private fn *Walk.walk_requires(dir: str, man: manifest.Manifest, chain: list.List<str>, is_test: bool): bool with (a: mem.Allocator) {
     var i: usize = 0
     for i < man.requires.len {
-        if !self.visit(man.requires.get(i), dir, chain) {
+        if !self.visit(man.requires.get(i), dir, chain, is_test) {
             return false
         }
         i = i + 1
     }
     return true
+}
+
+private fn *Walk.walk_test_requires(dir: str, man: manifest.Manifest, chain: list.List<str>): bool with (a: mem.Allocator) {
+    var i: usize = 0
+    for i < man.test_requires.len {
+        if !self.visit(man.test_requires.get(i), dir, chain, true) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+private fn copy_libdir(d: manifest.Libdir): manifest.Libdir with (a: mem.Allocator) {
+    var out: manifest.Libdir
+    out.path = fs.copy_str(d.path)
+    out.target = fs.copy_str(d.target)
+    return out
 }
 
 private fn node_from(w: Work): Node with (a: mem.Allocator) {
@@ -714,9 +756,15 @@ private fn node_from(w: Work): Node with (a: mem.Allocator) {
     n.dir = fs.copy_str(w.dir)
     n.hash = fs.copy_str(w.hash)
     n.has_version = w.has_version
+    n.is_test = w.is_test
     var i: usize = 0
     for i < w.man.requires.len {
         n.requires.push(fs.copy_str(w.man.requires.get(i).module))
+        i = i + 1
+    }
+    i = 0
+    for i < w.man.libdirs.len {
+        n.libdirs.push(copy_libdir(w.man.libdirs.get(i)))
         i = i + 1
     }
     i = 0
@@ -729,12 +777,15 @@ private fn node_from(w: Work): Node with (a: mem.Allocator) {
 
 /**
  * Build the dependency graph. A failure is already printed.
+ * When include_test is true, also walks the root's require.test lines
+ * (deps' require.test are ignored) and marks those nodes is_test.
  * @param root_dir module root, relative or absolute
  * @param jog_version compiler version from version
+ * @param include_test whether to resolve root require.test
  * @context a allocator for the graph
  * @return the graph, or ErrReported
  */
-fn resolve(root_dir: str, jog_version: manifest.Version): (Graph, error?) with (a: mem.Allocator) {
+fn resolve(root_dir: str, jog_version: manifest.Version, include_test: bool): (Graph, error?) with (a: mem.Allocator) {
     var g: Graph
     val root = prepare_root(root_dir)
     g.root_dir = root
@@ -761,8 +812,13 @@ fn resolve(root_dir: str, jog_version: manifest.Version): (Graph, error?) with (
     walk.jog_version = jog_version
     var chain: list.List<str>
     chain.push(fs.copy_str(man.module))
-    if !walk.walk_requires(root, man, chain) {
+    if !walk.walk_requires(root, man, chain, false) {
         return g, fail.ErrReported
+    }
+    if include_test {
+        if !walk.walk_test_requires(root, man, chain) {
+            return g, fail.ErrReported
+        }
     }
     var i: usize = 0
     for i < walk.order.len {
@@ -809,6 +865,14 @@ fn free(g: *Graph) with (a: mem.Allocator) {
             k = k + 1
         }
         n.requires.free()
+        k = 0
+        for k < n.libdirs.len {
+            var d = n.libdirs.get(k)
+            fs.free_str(d.path)
+            fs.free_str(d.target)
+            k = k + 1
+        }
+        n.libdirs.free()
         k = 0
         for k < n.chain.len {
             fs.free_str(n.chain.get(k))

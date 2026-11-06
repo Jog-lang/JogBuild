@@ -16,6 +16,13 @@ private fn entry(module: str, version: str, source: str, location: str, hash: st
     e.source = source
     e.location = location
     e.hash = hash
+    e.is_test = false
+    return e
+}
+
+private fn test_entry(module: str, version: str, source: str, location: str, hash: str): Entry {
+    var e = entry(module, version, source, location, hash)
+    e.is_test = true
     return e
 }
 
@@ -48,6 +55,10 @@ fn format_sorts_like_the_spec() with (t: testing.Testing) {
             t.expect(parsed.get(2).module == "sdl")
             t.expect(parsed.get(2).hash == "-")
         }
+        xs.push(test_entry("mock_fs", "0.1.0", "path", "./mocks/mock_fs", "-"))
+        val with_test = format(xs.slice_view())
+        val want_test = "# jog.lock: written by jog-build, do not edit\nlock 1\ndep json 1.4.0 cache - sha256:0c6f1e...\ndep mathx 1.2.0 archive ../vendor/mathx-1.2.0.jogz sha256:9f2c44...\ndep sdl 0.2.1 path ../sdl -\ndep.test mock_fs 0.1.0 path ./mocks/mock_fs -\n"
+        t.expectEq(with_test, want_test)
         val slashed = slash_spec("..\\vendor\\mathx-1.2.0.jogz")
         t.expectEq(slashed, "../vendor/mathx-1.2.0.jogz")
     }
