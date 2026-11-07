@@ -115,21 +115,28 @@ fn module_flags(g: resolve.Graph, include_test: bool): list.List<str> with (a: m
     return flags
 }
 
-private fn libdir_applies(target: str, host_os: str, wasm: bool): bool {
+private fn libdir_applies(target: str, host_os: str, build_target: str): bool {
     if target.len == 0 {
+        // Untargeted libdir applies on native and emscripten, not freestanding wasm32.
+        if build_target == "wasm32" {
+            return false
+        }
         return true
     }
-    if wasm {
+    if build_target == "wasm32-emscripten" {
+        return target == "emscripten"
+    }
+    if build_target == "wasm32" {
         return false
     }
     return target == host_os
 }
 
-private fn push_libdirs(flags: *list.List<str>, dirs: list.List<manifest.Libdir>, base_dir: str, host_os: str, wasm: bool) with (a: mem.Allocator) {
+private fn push_libdirs(flags: *list.List<str>, dirs: list.List<manifest.Libdir>, base_dir: str, host_os: str, build_target: str) with (a: mem.Allocator) {
     var i: usize = 0
     for i < dirs.len {
         val d = dirs.get(i)
-        if libdir_applies(d.target, host_os, wasm) {
+        if libdir_applies(d.target, host_os, build_target) {
             flags.push("--libdir")
             flags.push(resolve.absolute(base_dir, d.path))
         }
@@ -147,10 +154,10 @@ private fn split_env_libdirs(src: str): list.List<str> with (a: mem.Allocator) {
  * then CLI --libdir values. Relative paths are resolved against the
  * owning module directory (or left as given for CLI/env absolutes).
  */
-fn libdir_flags(g: resolve.Graph, include_test: bool, cli_dirs: []str, wasm_target: bool): list.List<str> with (a: mem.Allocator) {
+fn libdir_flags(g: resolve.Graph, include_test: bool, cli_dirs: []str, build_target: str): list.List<str> with (a: mem.Allocator) {
     var flags: list.List<str>
     val host_os = host.os_name()
-    push_libdirs(&flags, g.root.libdirs, g.root_dir, host_os, wasm_target)
+    push_libdirs(&flags, g.root.libdirs, g.root_dir, host_os, build_target)
     var i: usize = 0
     for i < g.nodes.len {
         val n = g.nodes.get(i)
@@ -158,7 +165,7 @@ fn libdir_flags(g: resolve.Graph, include_test: bool, cli_dirs: []str, wasm_targ
             i = i + 1
             continue
         }
-        push_libdirs(&flags, n.libdirs, n.dir, host_os, wasm_target)
+        push_libdirs(&flags, n.libdirs, n.dir, host_os, build_target)
         i = i + 1
     }
     val local_path = fs.join(g.root_dir, "jog.local.mod")
@@ -168,7 +175,7 @@ fn libdir_flags(g: resolve.Graph, include_test: bool, cli_dirs: []str, wasm_targ
         var (dirs, err, ok) = manifest.parse_local_overlay(body)
         a.free(local_data)
         if ok {
-            push_libdirs(&flags, dirs, g.root_dir, host_os, wasm_target)
+            push_libdirs(&flags, dirs, g.root_dir, host_os, build_target)
             manifest.free_libdirs(&dirs)
         } else {
             var b = strbuilder.empty()
