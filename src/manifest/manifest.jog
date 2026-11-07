@@ -647,8 +647,8 @@ private fn apply_link(m: *Manifest, words: list.List<Word>, line_no: i64, err: *
     if first.text != "link" {
         val tcol = first.col + 5
         target = text.slice(first.text, 5, first.text.len)
-        if target != "windows" && target != "linux" && target != "macos" {
-            return fail(err, line_no, tcol, with_word("jog.mod: unknown target '", target, "'; expected windows, linux, or macos"))
+        if target != "windows" && target != "linux" && target != "macos" && target != "emscripten" {
+            return fail(err, line_no, tcol, with_word("jog.mod: unknown target '", target, "'; expected windows, linux, macos, or emscripten"))
         }
     }
     if !one_word(words, "jog.mod: missing library name", "jog.mod: extra tokens after the library name", err, line_no) {
@@ -667,8 +667,8 @@ private fn apply_libdir(m: *Manifest, words: list.List<Word>, line_no: i64, err:
     if first.text != "libdir" {
         val tcol = first.col + 7
         target = text.slice(first.text, 7, first.text.len)
-        if target != "windows" && target != "linux" && target != "macos" {
-            return fail(err, line_no, tcol, with_word("jog.mod: unknown target '", target, "'; expected windows, linux, or macos"))
+        if target != "windows" && target != "linux" && target != "macos" && target != "emscripten" {
+            return fail(err, line_no, tcol, with_word("jog.mod: unknown target '", target, "'; expected windows, linux, macos, or emscripten"))
         }
     }
     if !one_word(words, "jog.mod: missing library search path", "jog.mod: extra tokens after the library search path", err, line_no) {
