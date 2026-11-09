@@ -52,9 +52,9 @@ fn usage(to_err: bool) {
     say(to_err, "")
     say(to_err, "commands:")
     say(to_err, "  jog-build init [--lib] [name]                    write jog.mod, a root file, and .gitignore")
-    say(to_err, "  jog-build build [--release | --release-fast] [--keep-c] [--target wasm32] [-o file] [--libdir dir]...")
+    say(to_err, "  jog-build build [--release | --release-fast] [--keep-c] [--target wasm32|wasm32-emscripten] [-o file] [--libdir dir]...")
     say(to_err, "                                                   resolve, write jog.lock, and run jog build")
-    say(to_err, "  jog-build run [--target wasm32] [--libdir dir]... [-- args...]")
+    say(to_err, "  jog-build run [--target wasm32|wasm32-emscripten] [--libdir dir]... [-- args...]")
     say(to_err, "                                                   resolve, write jog.lock, and run jog run")
     say(to_err, "  jog-build test [--all] [--libdir dir]...         resolve with require.test, write jog.lock, run jog test")
     say(to_err, "                                                   --all is accepted and ignored (root already loads all tests)")
@@ -252,7 +252,7 @@ private fn apply_long(command: str, f: *Flags, arg: str, args: []str, i: usize):
             value = args[i + 1]
             next = i + 2
         }
-        if value != "wasm32" {
+        if value != "wasm32" && value != "wasm32-emscripten" {
             return false, 0
         }
         f.target = value
@@ -458,9 +458,9 @@ private fn load(): (Loaded, error?) with (a: mem.Allocator) {
     return loaded, null
 }
 
-private fn jog_flags(g: resolve.Graph, include_test: bool, cli_dirs: []str, wasm_target: bool): list.List<str> with (a: mem.Allocator) {
+private fn jog_flags(g: resolve.Graph, include_test: bool, cli_dirs: []str, build_target: str): list.List<str> with (a: mem.Allocator) {
     var mods = compiler.module_flags(g, include_test)
-    var libs = compiler.libdir_flags(g, include_test, cli_dirs, wasm_target)
+    var libs = compiler.libdir_flags(g, include_test, cli_dirs, build_target)
     var i: usize = 0
     for i < libs.len {
         mods.push(libs.get(i))
@@ -478,8 +478,7 @@ private fn build_in(f: Flags): i32 with (a: mem.Allocator) {
     if !write_lock(loaded.root, loaded.graph) {
         return 1
     }
-    val wasm = f.target == "wasm32"
-    var mods = jog_flags(loaded.graph, false, f.libdirs.slice_view(), wasm)
+    var mods = jog_flags(loaded.graph, false, f.libdirs.slice_view(), f.target)
     var extra: list.List<str>
     var sub = "build"
     if loaded.graph.root.library {
@@ -526,8 +525,7 @@ private fn run_in(f: Flags, args: []str): i32 with (a: mem.Allocator) {
     if !write_lock(loaded.root, loaded.graph) {
         return 1
     }
-    val wasm = f.target == "wasm32"
-    var mods = jog_flags(loaded.graph, false, f.libdirs.slice_view(), wasm)
+    var mods = jog_flags(loaded.graph, false, f.libdirs.slice_view(), f.target)
     var extra: list.List<str>
     if f.target.len > 0 {
         extra.push("--target")
@@ -566,7 +564,7 @@ private fn test_in(f: Flags): i32 with (a: mem.Allocator) {
     // --all is accepted for compatibility with jog test --all and is
     // otherwise a no-op: the absolute root already loads every root
     // *.test.jog. proc.run has no working directory.
-    var mods = jog_flags(loaded.graph, true, f.libdirs.slice_view(), false)
+    var mods = jog_flags(loaded.graph, true, f.libdirs.slice_view(), "")
     var extra: list.List<str>
     var argv = compiler.command(loaded.jog, "test", loaded.root, mods.slice_view(), extra.slice_view())
     return compiler.run_jog(argv.slice_view())
@@ -602,7 +600,7 @@ private fn pack_in(f: Flags): i32 with (a: mem.Allocator) {
         io.eprintln("' has no version")
         return 1
     }
-    var mods = jog_flags(loaded.graph, false, f.libdirs.slice_view(), false)
+    var mods = jog_flags(loaded.graph, false, f.libdirs.slice_view(), "")
     var extra: list.List<str>
     var argv = compiler.command(loaded.jog, "check", loaded.root, mods.slice_view(), extra.slice_view())
     val code = compiler.run_jog(argv.slice_view())
