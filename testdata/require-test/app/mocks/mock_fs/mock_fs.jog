@@ -1,3 +1,0 @@
-fn ready(): bool {
-    return true
-}

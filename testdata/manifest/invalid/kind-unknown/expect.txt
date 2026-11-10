@@ -1,1 +1,0 @@
-jog.mod:2:6: error: jog.mod: unknown kind 'plugin'; expected executable or library

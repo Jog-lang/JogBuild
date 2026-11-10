@@ -1,1 +1,0 @@
-jog.mod:2:1: error: jog.mod: 'provides' is reserved for a later version

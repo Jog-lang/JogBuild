@@ -1,1 +1,0 @@
-jog.mod:1:8: error: jog.mod: module name 'jog-build' is not an identifier

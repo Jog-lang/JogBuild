@@ -1,1 +1,0 @@
-jog.mod:2:8: error: jog.mod: unknown target 'freebsd'; expected windows, linux, or macos

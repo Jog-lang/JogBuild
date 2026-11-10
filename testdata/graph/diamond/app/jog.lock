@@ -1,0 +1,5 @@
+# jog.lock: written by jog-build, do not edit
+lock 1
+dep a 1.0.0 path ../a -
+dep b 2.0.0 path ../b -
+dep c 0.4.0 path ../b/../c -

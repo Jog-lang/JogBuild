@@ -1,7 +1,0 @@
-// Not shipped: *.test.jog files are excluded from src/.
-import std.testing
-
-@test
-fn name() with (t: testing.Testing) {
-    t.expectEq(base_name(), "base")
-}

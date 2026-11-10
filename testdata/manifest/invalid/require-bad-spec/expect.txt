@@ -1,1 +1,0 @@
-jog.mod:2:13: error: jog.mod: 'latest' is neither a path nor a version

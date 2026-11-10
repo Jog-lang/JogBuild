@@ -1,2 +1,0 @@
-module Json
-kind library

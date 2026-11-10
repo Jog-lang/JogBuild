@@ -1,3 +1,0 @@
-fn name(): str {
-    return "app util"
-}

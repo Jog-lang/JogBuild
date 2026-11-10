@@ -1,5 +1,3 @@
+.zig-cache/
+zig-out/
 out/
-build/
-*.exe
-*.c
-jog.lock

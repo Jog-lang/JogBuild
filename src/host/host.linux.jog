@@ -1,5 +1,0 @@
-// Linux body for os_name. Other host expects stay in host.posix.jog.
-
-actual fn os_name(): str {
-    return "linux"
-}
