@@ -4,6 +4,7 @@ import std.c
 import std.fs
 import std.mem
 import std.os
+import std.strbuilder
 
 actual fn path_sep(): u8 {
     return ';' as u8
@@ -69,4 +70,40 @@ actual fn cache_dir(): str with (a: mem.Allocator) {
     fs.free_str(local_copy)
     fs.free_str(jog)
     return root
+}
+
+actual fn prepend_loader_dirs(dirs: []str) with (a: mem.Allocator) {
+    if dirs.len == 0 {
+        return
+    }
+    var buf = strbuilder.empty()
+    var i: usize = 0
+    for i < dirs.len {
+        if dirs[i].len == 0 {
+            i = i + 1
+            continue
+        }
+        if buf.len > 0 {
+            buf.append_byte(';' as u8)
+        }
+        buf.append(dirs[i])
+        i = i + 1
+    }
+    if buf.len == 0 {
+        buf.free()
+        return
+    }
+    var (cur, ok) = os.env("PATH")
+    if ok && cur.len > 0 {
+        buf.append_byte(';' as u8)
+        buf.append(cur)
+    }
+    var name_w: [8]u16
+    var val_w: [8192]u16
+    if !c.utf8_to_wide("PATH", name_w[..].ptr, 8) || !c.utf8_to_wide(buf.str(), val_w[..].ptr, 8192) {
+        buf.free()
+        return
+    }
+    _ = c.SetEnvironmentVariableW(name_w[..].ptr, val_w[..].ptr)
+    buf.free()
 }

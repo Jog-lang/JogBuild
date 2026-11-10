@@ -61,3 +61,11 @@ expect fn remove_dir(path: str)
  * @return an owned path, or empty
  */
 expect fn cache_dir(): str with (a: mem.Allocator)
+
+/**
+ * Prepend libdirs to the child loader search path for `jog-build run`
+ * (LD_LIBRARY_PATH / DYLD_LIBRARY_PATH / PATH). No-op when dirs is empty.
+ * @param dirs absolute library directories, in order
+ * @context a allocator for the joined env value
+ */
+expect fn prepend_loader_dirs(dirs: []str) with (a: mem.Allocator)
