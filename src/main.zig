@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const version_string = "jog-build 0.2.0-v2 (zig; forwards to JogCompiler v2)";
+const version_string = "jog-build 0.2.1-v2 (zig; forwards to JogCompiler v2)";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -31,9 +31,22 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "deps")) {
-        // v2: no --module graph yet; empty flags keep LSP callers happy.
-        while (args.next()) |_| {}
-        return;
+        // Accept and ignore legacy flags (--flags, --test, …) for callers that
+        // still pass them; emit source paths from jog.mod (or forward to jog).
+        var path: []const u8 = ".";
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--flags") or std.mem.eql(u8, a, "--test")) {
+                continue;
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                continue;
+            } else {
+                path = a;
+            }
+        }
+        const jog = try findJog(allocator);
+        defer allocator.free(jog);
+        const code = try runJog(allocator, jog, &.{ "deps", path }, stdout, stderr);
+        std.process.exit(code);
     }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "build") or std.mem.eql(u8, cmd, "run")) {
         const jog = try findJog(allocator);
@@ -57,7 +70,7 @@ pub fn main() !void {
             }
         }
 
-        const source = try resolveSource(allocator, path);
+        const source = try resolveBuildPath(allocator, path);
         defer allocator.free(source);
 
         if (std.mem.eql(u8, cmd, "check")) {
@@ -112,10 +125,11 @@ fn usage(w: anytype) !void {
         \\  check [path] [--diag=json]
         \\  build [path] -o OUT
         \\  run   [path] -o OUT     build then execute OUT
-        \\  deps                    no-op (module graph deferred)
+        \\  deps [path]             print jog.mod source paths (via jog deps)
         \\  help
         \\
-        \\path may be a .jog file or a directory containing main.jog.
+        \\path may be a .jog file, a directory with jog.mod, or jog.mod itself.
+        \\Directories without jog.mod still fall back to main.jog.
         \\
     );
 }
@@ -181,11 +195,18 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-fn resolveSource(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+/// Prefer a module directory (pass through to jog) when jog.mod exists;
+/// otherwise keep the old main.jog fallback for plain directories.
+fn resolveBuildPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const st = std.fs.cwd().statFile(path) catch {
         return try allocator.dupe(u8, path);
     };
     if (st.kind == .directory) {
+        const mod_path = try std.fs.path.join(allocator, &.{ path, "jog.mod" });
+        defer allocator.free(mod_path);
+        if (fileExists(mod_path)) {
+            return try allocator.dupe(u8, path);
+        }
         return try std.fs.path.join(allocator, &.{ path, "main.jog" });
     }
     return try allocator.dupe(u8, path);

@@ -19,9 +19,9 @@ export JOG=/path/to/JogCompiler-v2/zig-out/bin/jog
 | Command | Behavior |
 |---|---|
 | `version` | Print jog-build + jog versions |
-| `check [path]` | `jog check` (path or `dir/main.jog`) |
+| `check [path]` | `jog check` (dir with `jog.mod`, else `dir/main.jog`) |
 | `build [path] -o OUT` | `jog build … -o OUT` |
 | `run [path] -o OUT` | build then execute |
-| `deps` | no-op (module flags deferred) |
+| `deps [path]` | `jog deps` — one source path per line |
 
 Design: JogDocs `design/v2/`.
