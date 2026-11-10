@@ -18,6 +18,7 @@ import std.os
 import std.strbuilder
 
 import src.compiler
+import src.host
 import src.lockfile
 import src.manifest
 import src.pack
@@ -526,6 +527,19 @@ private fn run_in(f: Flags, args: []str): i32 with (a: mem.Allocator) {
         return 1
     }
     var mods = jog_flags(loaded.graph, false, f.libdirs.slice_view(), f.target)
+    // Fallback when rpath is missing: prepend libdirs to the loader env
+    // for jog and the program it execs.
+    var loader_dirs: list.List<str>
+    var li: usize = 0
+    for li < mods.len {
+        if mods.get(li) == "--libdir" && li + 1 < mods.len {
+            loader_dirs.push(mods.get(li + 1))
+            li = li + 2
+            continue
+        }
+        li = li + 1
+    }
+    host.prepend_loader_dirs(loader_dirs.slice_view())
     var extra: list.List<str>
     if f.target.len > 0 {
         extra.push("--target")
