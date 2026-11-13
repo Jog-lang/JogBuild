@@ -1,0 +1,8 @@
+// Multi-file jog.mod smoke with go/yield (module graph + coro runtime).
+
+fn main() {
+    dispatcher_single()
+    go(worker, null)
+    coro_drain()
+    print("coro_mod ok\n")
+}

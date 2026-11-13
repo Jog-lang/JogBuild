@@ -1,0 +1,21 @@
+// Smoke: go/yield + dispatcher_single (Gate 1). Runtime linked by jog build.
+
+fn a(arg: *byte) {
+    print("a1\n")
+    yield()
+    print("a2\n")
+}
+
+fn b(arg: *byte) {
+    print("b1\n")
+    yield()
+    print("b2\n")
+}
+
+fn main() {
+    dispatcher_single()
+    go(a, null)
+    go(b, null)
+    coro_drain()
+    print("done\n")
+}

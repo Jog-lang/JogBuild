@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const version_string = "jog-build 0.2.1-v2 (zig; forwards to JogCompiler v2)";
+const version_string = "jog-build 0.2.3-v2 (zig; forwards to JogCompiler v2 post-concurrency)";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -45,7 +45,9 @@ pub fn main() !void {
         }
         const jog = try findJog(allocator);
         defer allocator.free(jog);
-        const code = try runJog(allocator, jog, &.{ "deps", path }, stdout, stderr);
+        const source = try resolveBuildPath(allocator, path);
+        defer allocator.free(source);
+        const code = try runJog(allocator, jog, &.{ "deps", source }, stdout, stderr);
         std.process.exit(code);
     }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "build") or std.mem.eql(u8, cmd, "run")) {
@@ -56,8 +58,19 @@ pub fn main() !void {
         var out_path: ?[]const u8 = null;
         var extras: std.ArrayListUnmanaged([]const u8) = .{};
         defer extras.deinit(allocator);
+        var run_args: std.ArrayListUnmanaged([]const u8) = .{};
+        defer run_args.deinit(allocator);
+        var saw_ddash = false;
 
         while (args.next()) |a| {
+            if (saw_ddash) {
+                try run_args.append(allocator, a);
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--")) {
+                saw_ddash = true;
+                continue;
+            }
             if (std.mem.eql(u8, a, "-o")) {
                 out_path = args.next() orelse {
                     try stderr.writeAll("missing -o path\n");
@@ -97,7 +110,11 @@ pub fn main() !void {
         }
 
         if (std.mem.eql(u8, cmd, "run")) {
-            var child = std.process.Child.init(&.{out}, allocator);
+            var argv: std.ArrayListUnmanaged([]const u8) = .{};
+            defer argv.deinit(allocator);
+            try argv.append(allocator, out);
+            for (run_args.items) |a| try argv.append(allocator, a);
+            var child = std.process.Child.init(argv.items, allocator);
             child.stdout_behavior = .Inherit;
             child.stderr_behavior = .Inherit;
             const term = try child.spawnAndWait();
@@ -118,13 +135,16 @@ fn usage(w: anytype) !void {
     try w.writeAll(
         \\usage: jog-build <command> [args]
         \\
-        \\v2 Zig front-end for JogCompiler v2. Resolves JOG / jog-v2 / jog.
+        \\v2 Zig front-end for JogCompiler v2 (Gates 1–4 + Chase-Lev).
+        \\Finds JOG / jog-v2 / sibling JogCompiler-v2 / PATH jog.
+        \\Concurrency (go/yield, with (Dispatcher), dispatcher_io) needs no
+        \\extra flags — the compiler always links runtime/linux_x64_coro.s.
         \\
         \\commands:
         \\  version
         \\  check [path] [--diag=json]
-        \\  build [path] -o OUT
-        \\  run   [path] -o OUT     build then execute OUT
+        \\  build [path] -o OUT [--keep-asm]
+        \\  run   [path] -o OUT [--keep-asm] [-- prog-args...]
         \\  deps [path]             print jog.mod source paths (via jog deps)
         \\  help
         \\
@@ -139,22 +159,19 @@ fn findJog(allocator: std.mem.Allocator) ![]const u8 {
         if (j.len > 0) return try allocator.dupe(u8, j);
     }
     const home = std.posix.getenv("HOME") orelse "";
-    const candidates = [_][]const u8{
-        "jog-v2",
-        "jog",
-    };
-    // Prefer ~/.local/bin/jog-v2 then PATH search via which-like
     if (home.len > 0) {
         const local = try std.fs.path.join(allocator, &.{ home, ".local/bin/jog-v2" });
         defer allocator.free(local);
         if (fileExists(local)) return try allocator.dupe(u8, local);
         const local_jog = try std.fs.path.join(allocator, &.{ home, ".local/bin/jog" });
         defer allocator.free(local_jog);
-        // Only use ~/.local/bin/jog if it looks like v2
         if (fileExists(local_jog)) {
             if (try isV2Jog(allocator, local_jog)) return try allocator.dupe(u8, local_jog);
         }
     }
+    if (try siblingCompilerJog(allocator)) |p| return p;
+
+    const candidates = [_][]const u8{ "jog-v2", "jog" };
     for (candidates) |name| {
         if (try which(allocator, name)) |p| {
             if (try isV2Jog(allocator, p) or std.mem.eql(u8, name, "jog-v2")) {
@@ -167,6 +184,34 @@ fn findJog(allocator: std.mem.Allocator) ![]const u8 {
     std.process.exit(1);
 }
 
+/// Prefer a checkout next to JogBuild: ../JogCompiler-v2/zig-out/bin/jog
+/// (also tried relative to this binary's directory).
+fn siblingCompilerJog(allocator: std.mem.Allocator) !?[]const u8 {
+    const rel = "JogCompiler-v2/zig-out/bin/jog";
+    const cwd_cand = try std.fs.path.join(allocator, &.{ "..", rel });
+    defer allocator.free(cwd_cand);
+    if (fileExists(cwd_cand)) {
+        if (try isV2Jog(allocator, cwd_cand)) return try allocator.dupe(u8, cwd_cand);
+    }
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = std.fs.selfExePath(&buf) catch return null;
+    const exe_dir = std.fs.path.dirname(exe) orelse return null;
+    // zig-out/bin → ../../.. → Jog tree root sibling
+    const from_bin = try std.fs.path.join(allocator, &.{ exe_dir, "../../..", rel });
+    defer allocator.free(from_bin);
+    if (fileExists(from_bin)) {
+        if (try isV2Jog(allocator, from_bin)) return try allocator.dupe(u8, from_bin);
+    }
+    // source-tree layout: JogBuild/zig-out/bin → JogBuild → sibling
+    const from_build = try std.fs.path.join(allocator, &.{ exe_dir, "../..", rel });
+    defer allocator.free(from_build);
+    if (fileExists(from_build)) {
+        if (try isV2Jog(allocator, from_build)) return try allocator.dupe(u8, from_build);
+    }
+    return null;
+}
+
 fn isV2Jog(allocator: std.mem.Allocator, path: []const u8) !bool {
     var child = std.process.Child.init(&.{ path, "version" }, allocator);
     child.stdout_behavior = .Pipe;
@@ -175,7 +220,8 @@ fn isV2Jog(allocator: std.mem.Allocator, path: []const u8) !bool {
     const out = try child.stdout.?.readToEndAlloc(allocator, 4096);
     defer allocator.free(out);
     _ = try child.wait();
-    return std.mem.indexOf(u8, out, "0.2.0-v2") != null or std.mem.indexOf(u8, out, "v2") != null;
+    // Match 0.2.x-v2 and any "v2" marker from JogCompiler v2.
+    return std.mem.indexOf(u8, out, "-v2") != null or std.mem.indexOf(u8, out, "v2") != null;
 }
 
 fn which(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
@@ -208,6 +254,12 @@ fn resolveBuildPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
             return try allocator.dupe(u8, path);
         }
         return try std.fs.path.join(allocator, &.{ path, "main.jog" });
+    }
+    // Bare jog.mod file → use its directory so deps/build see the module root.
+    if (std.mem.eql(u8, std.fs.path.basename(path), "jog.mod")) {
+        if (std.fs.path.dirname(path)) |dir| {
+            return try allocator.dupe(u8, dir);
+        }
     }
     return try allocator.dupe(u8, path);
 }
