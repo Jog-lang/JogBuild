@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const version_string = "jog-build 0.2.4-v2 (zig; forwards to JogCompiler v2; wasm32-emscripten)";
+const version_string = "jog-build 0.2.5-v2 (zig; forwards to JogCompiler v2; deps --flags)";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -31,12 +31,15 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "deps")) {
-        // Accept and ignore legacy flags (--flags, --test, …) for callers that
-        // still pass them; emit source paths from jog.mod (or forward to jog).
+        // Forward `--flags` / `--test` to jog (JOG-92 LSP module mappings).
         var path: []const u8 = ".";
+        var flags = false;
+        var include_test = false;
         while (args.next()) |a| {
-            if (std.mem.eql(u8, a, "--flags") or std.mem.eql(u8, a, "--test")) {
-                continue;
+            if (std.mem.eql(u8, a, "--flags")) {
+                flags = true;
+            } else if (std.mem.eql(u8, a, "--test")) {
+                include_test = true;
             } else if (std.mem.startsWith(u8, a, "-")) {
                 continue;
             } else {
@@ -47,7 +50,13 @@ pub fn main() !void {
         defer allocator.free(jog);
         const source = try resolveBuildPath(allocator, path);
         defer allocator.free(source);
-        const code = try runJog(allocator, jog, &.{ "deps", source }, stdout, stderr);
+        var jog_args: std.ArrayListUnmanaged([]const u8) = .{};
+        defer jog_args.deinit(allocator);
+        try jog_args.append(allocator, "deps");
+        if (flags) try jog_args.append(allocator, "--flags");
+        if (include_test) try jog_args.append(allocator, "--test");
+        try jog_args.append(allocator, source);
+        const code = try runJog(allocator, jog, jog_args.items, stdout, stderr);
         std.process.exit(code);
     }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "build") or std.mem.eql(u8, cmd, "run")) {
@@ -111,7 +120,16 @@ pub fn main() !void {
             } else if (std.mem.startsWith(u8, a, "-L") and a.len > 2) {
                 try extras.append(allocator, "--libdir");
                 try extras.append(allocator, a[2..]);
-            } else if (std.mem.eql(u8, a, "--keep-asm") or std.mem.eql(u8, a, "--keep-c") or std.mem.eql(u8, a, "--diag=json")) {
+            } else if (std.mem.eql(u8, a, "--keep-asm") or std.mem.eql(u8, a, "--keep-c") or std.mem.eql(u8, a, "--diag=json") or std.mem.eql(u8, a, "--test")) {
+                try extras.append(allocator, a);
+            } else if (std.mem.eql(u8, a, "--module")) {
+                const v = args.next() orelse {
+                    try stderr.writeAll("missing --module name=dir\n");
+                    std.process.exit(2);
+                };
+                try extras.append(allocator, "--module");
+                try extras.append(allocator, v);
+            } else if (std.mem.startsWith(u8, a, "--module=")) {
                 try extras.append(allocator, a);
             } else if (std.mem.startsWith(u8, a, "-")) {
                 try stderr.print("unknown flag {s}\n", .{a});
@@ -185,12 +203,14 @@ fn usage(w: anytype) !void {
         \\  build [path] -o OUT [--keep-asm] [--keep-c]
         \\        [--target wasm32-emscripten] [--libdir DIR | -L DIR]...
         \\  run   [path] -o OUT [--keep-asm] [-- prog-args...]
-        \\  deps [path]             print jog.mod source paths (via jog deps)
+        \\  deps [--flags] [--test] [path]
+        \\        source paths, or --module=name=dir for LSP (via jog deps)
         \\  help
         \\
         \\path may be a .jog file, a directory with jog.mod, or jog.mod itself.
         \\Directories without jog.mod still fall back to main.jog.
         \\wasm32-emscripten: forwards to jog; output defaults to a.out.html.
+        \\check/build also forward --module name=dir when given.
         \\
     );
 }
