@@ -1,0 +1,5 @@
+fn worker(arg: *byte) {
+    print("w1\n")
+    yield()
+    print("w2\n")
+}
