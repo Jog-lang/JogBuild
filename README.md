@@ -30,10 +30,11 @@ Concurrency examples need **no extra flags** — `jog build` always links `runti
 |---|---|
 | `version` | Print jog-build + jog versions |
 | `check [path]` | `jog check` (`--diag=json` forwarded) |
-| `build [path] -o OUT` | `jog build … -o OUT` (`--keep-asm` forwarded) |
+| `build [path] -o OUT` | `jog build … -o OUT` (`--keep-asm` / `--keep-c` / `--libdir` forwarded) |
+| `build … --target wasm32-emscripten` | Forwards to jog (JOG-90); default OUT `a.out.html` |
 | `run [path] -o OUT [-- args]` | build then execute OUT (optional program args after `--`) |
 | `deps [path]` | `jog deps` — one source path per line from `jog.mod` |
 
 `path` may be a `.jog` file, a directory with `jog.mod`, or `jog.mod` itself. Directories without `jog.mod` fall back to `main.jog`.
 
-Cross-module `require` / `--module` still deferred. Design: JogDocs `design/v2/`.
+Cross-module `require` / `--module` still deferred. Design: JogDocs `design/v2/`. Browser+SDL: JogSDL `v2/examples/*-emscripten` + emsdk.

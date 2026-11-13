@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const version_string = "jog-build 0.2.3-v2 (zig; forwards to JogCompiler v2 post-concurrency)";
+const version_string = "jog-build 0.2.4-v2 (zig; forwards to JogCompiler v2; wasm32-emscripten)";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -61,6 +61,7 @@ pub fn main() !void {
         var run_args: std.ArrayListUnmanaged([]const u8) = .{};
         defer run_args.deinit(allocator);
         var saw_ddash = false;
+        var emscripten = false;
 
         while (args.next()) |a| {
             if (saw_ddash) {
@@ -76,8 +77,45 @@ pub fn main() !void {
                     try stderr.writeAll("missing -o path\n");
                     std.process.exit(2);
                 };
-            } else if (std.mem.startsWith(u8, a, "-")) {
+            } else if (std.mem.eql(u8, a, "--target")) {
+                const t = args.next() orelse {
+                    try stderr.writeAll("missing --target value (wasm32-emscripten)\n");
+                    std.process.exit(2);
+                };
+                if (!std.mem.eql(u8, t, "wasm32-emscripten")) {
+                    try stderr.print("unsupported --target {s} (v2: wasm32-emscripten)\n", .{t});
+                    std.process.exit(2);
+                }
+                emscripten = true;
+                try extras.append(allocator, "--target");
+                try extras.append(allocator, t);
+            } else if (std.mem.startsWith(u8, a, "--target=")) {
+                const t = a["--target=".len..];
+                if (!std.mem.eql(u8, t, "wasm32-emscripten")) {
+                    try stderr.print("unsupported --target {s} (v2: wasm32-emscripten)\n", .{t});
+                    std.process.exit(2);
+                }
+                emscripten = true;
+                try extras.append(allocator, "--target");
+                try extras.append(allocator, t);
+            } else if (std.mem.eql(u8, a, "--libdir") or std.mem.eql(u8, a, "-L")) {
+                const dir = args.next() orelse {
+                    try stderr.writeAll("missing --libdir path\n");
+                    std.process.exit(2);
+                };
+                try extras.append(allocator, "--libdir");
+                try extras.append(allocator, dir);
+            } else if (std.mem.startsWith(u8, a, "--libdir=")) {
+                try extras.append(allocator, "--libdir");
+                try extras.append(allocator, a["--libdir=".len..]);
+            } else if (std.mem.startsWith(u8, a, "-L") and a.len > 2) {
+                try extras.append(allocator, "--libdir");
+                try extras.append(allocator, a[2..]);
+            } else if (std.mem.eql(u8, a, "--keep-asm") or std.mem.eql(u8, a, "--keep-c") or std.mem.eql(u8, a, "--diag=json")) {
                 try extras.append(allocator, a);
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                try stderr.print("unknown flag {s}\n", .{a});
+                std.process.exit(2);
             } else {
                 path = a;
             }
@@ -96,7 +134,8 @@ pub fn main() !void {
             std.process.exit(code);
         }
 
-        const out = out_path orelse "a.out";
+        const default_out: []const u8 = if (emscripten) "a.out.html" else "a.out";
+        const out = out_path orelse default_out;
         {
             var argv: std.ArrayListUnmanaged([]const u8) = .{};
             defer argv.deinit(allocator);
@@ -143,13 +182,15 @@ fn usage(w: anytype) !void {
         \\commands:
         \\  version
         \\  check [path] [--diag=json]
-        \\  build [path] -o OUT [--keep-asm]
+        \\  build [path] -o OUT [--keep-asm] [--keep-c]
+        \\        [--target wasm32-emscripten] [--libdir DIR | -L DIR]...
         \\  run   [path] -o OUT [--keep-asm] [-- prog-args...]
         \\  deps [path]             print jog.mod source paths (via jog deps)
         \\  help
         \\
         \\path may be a .jog file, a directory with jog.mod, or jog.mod itself.
         \\Directories without jog.mod still fall back to main.jog.
+        \\wasm32-emscripten: forwards to jog; output defaults to a.out.html.
         \\
     );
 }
