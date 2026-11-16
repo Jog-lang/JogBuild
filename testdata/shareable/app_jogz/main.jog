@@ -1,0 +1,9 @@
+import greeter.greeter
+
+fn main() {
+    if (greet_answer() == 42) {
+        print("jogz ok\n")
+    } else {
+        panic("jogz fail\n")
+    }
+}

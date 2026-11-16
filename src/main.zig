@@ -1,6 +1,9 @@
 const std = @import("std");
+const manifest = @import("manifest.zig");
+const resolve = @import("resolve.zig");
+const pack = @import("pack.zig");
 
-const version_string = "jog-build 0.2.5-v2 (zig; forwards to JogCompiler v2; deps --flags)";
+const version_string = "jog-build 0.3.0-v2 (zig; resolve/pack/cache + JogCompiler v2)";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -31,7 +34,6 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "deps")) {
-        // Forward `--flags` / `--test` to jog (JOG-92 LSP module mappings).
         var path: []const u8 = ".";
         var flags = false;
         var include_test = false;
@@ -46,18 +48,72 @@ pub fn main() !void {
                 path = a;
             }
         }
-        const jog = try findJog(allocator);
-        defer allocator.free(jog);
         const source = try resolveBuildPath(allocator, path);
         defer allocator.free(source);
-        var jog_args: std.ArrayListUnmanaged([]const u8) = .{};
-        defer jog_args.deinit(allocator);
-        try jog_args.append(allocator, "deps");
-        if (flags) try jog_args.append(allocator, "--flags");
-        if (include_test) try jog_args.append(allocator, "--test");
-        try jog_args.append(allocator, source);
-        const code = try runJog(allocator, jog, jog_args.items, stdout, stderr);
-        std.process.exit(code);
+        var graph = resolve.resolveGraph(allocator, source, include_test) catch |err| {
+            try stderr.print("jog-build deps: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer graph.deinit();
+        if (flags) {
+            try resolve.emitModuleFlags(stdout, &graph);
+        } else {
+            for (graph.nodes.items) |n| {
+                try stdout.print("{s} {s} {s} {s}\n", .{ n.name, n.version, @tagName(n.kind), n.dir });
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, cmd, "pack")) {
+        var path: []const u8 = ".";
+        var out_path: ?[]const u8 = null;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "-o")) {
+                out_path = args.next() orelse {
+                    try stderr.writeAll("missing -o path\n");
+                    std.process.exit(2);
+                };
+            } else if (std.mem.startsWith(u8, a, "-")) {
+                try stderr.print("unknown flag {s}\n", .{a});
+                std.process.exit(2);
+            } else {
+                path = a;
+            }
+        }
+        const source = try resolveBuildPath(allocator, path);
+        defer allocator.free(source);
+        var graph = resolve.resolveGraph(allocator, source, false) catch |err| {
+            try stderr.print("jog-build pack: resolve {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer graph.deinit();
+
+        // jog check with module flags
+        const jog = try findJog(allocator);
+        defer allocator.free(jog);
+        {
+            var argv: std.ArrayListUnmanaged([]const u8) = .{};
+            defer {
+                // module flags owned
+                for (argv.items) |x| {
+                    if (std.mem.startsWith(u8, x, "--module=")) allocator.free(x);
+                }
+                argv.deinit(allocator);
+            }
+            try argv.append(allocator, "check");
+            try resolve.appendModuleArgs(allocator, &argv, &graph);
+            try argv.append(allocator, source);
+            const code = try runJog(allocator, jog, argv.items, stdout, stderr);
+            if (code != 0) std.process.exit(code);
+        }
+
+        var result = pack.packModule(allocator, source, out_path, &graph) catch |err| {
+            try stderr.print("jog-build pack: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer result.deinit();
+        try stdout.print("{s}\n{s}\n", .{ result.path, result.hash });
+        return;
     }
     if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "build") or std.mem.eql(u8, cmd, "run")) {
         const jog = try findJog(allocator);
@@ -71,6 +127,7 @@ pub fn main() !void {
         defer run_args.deinit(allocator);
         var saw_ddash = false;
         var emscripten = false;
+        var skip_resolve = false;
 
         while (args.next()) |a| {
             if (saw_ddash) {
@@ -123,6 +180,7 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, a, "--keep-asm") or std.mem.eql(u8, a, "--keep-c") or std.mem.eql(u8, a, "--diag=json") or std.mem.eql(u8, a, "--test")) {
                 try extras.append(allocator, a);
             } else if (std.mem.eql(u8, a, "--module")) {
+                skip_resolve = true;
                 const v = args.next() orelse {
                     try stderr.writeAll("missing --module name=dir\n");
                     std.process.exit(2);
@@ -130,6 +188,7 @@ pub fn main() !void {
                 try extras.append(allocator, "--module");
                 try extras.append(allocator, v);
             } else if (std.mem.startsWith(u8, a, "--module=")) {
+                skip_resolve = true;
                 try extras.append(allocator, a);
             } else if (std.mem.startsWith(u8, a, "-")) {
                 try stderr.print("unknown flag {s}\n", .{a});
@@ -142,11 +201,64 @@ pub fn main() !void {
         const source = try resolveBuildPath(allocator, path);
         defer allocator.free(source);
 
+        var owned_flags: std.ArrayListUnmanaged([]u8) = .{};
+        defer {
+            for (owned_flags.items) |f| allocator.free(f);
+            owned_flags.deinit(allocator);
+        }
+
+        if (!skip_resolve) {
+            // Resolve when jog.mod exists; plain files skip.
+            const mod_file = try std.fs.path.join(allocator, &.{ source, "jog.mod" });
+            defer allocator.free(mod_file);
+            if (fileExists(mod_file) or std.mem.eql(u8, std.fs.path.basename(path), "jog.mod") or isDir(source)) {
+                if (fileExists(mod_file)) {
+                    var graph = resolve.resolveGraph(allocator, source, false) catch |err| {
+                        try stderr.print("jog-build: resolve {s}\n", .{@errorName(err)});
+                        std.process.exit(1);
+                    };
+                    defer graph.deinit();
+                    for (graph.nodes.items) |n| {
+                        const abs = std.fs.cwd().realpathAlloc(allocator, n.dir) catch try allocator.dupe(u8, n.dir);
+                        const flag = try std.fmt.allocPrint(allocator, "--module={s}={s}", .{ n.name, abs });
+                        allocator.free(abs);
+                        try owned_flags.append(allocator, flag);
+                    }
+                }
+            }
+        }
+
         if (std.mem.eql(u8, cmd, "check")) {
             var argv: std.ArrayListUnmanaged([]const u8) = .{};
             defer argv.deinit(allocator);
             try argv.append(allocator, "check");
             for (extras.items) |e| try argv.append(allocator, e);
+            for (owned_flags.items) |f| try argv.append(allocator, f);
+            try argv.append(allocator, source);
+            // Libraries: check is correct; executables too.
+            const code = try runJog(allocator, jog, argv.items, stdout, stderr);
+            std.process.exit(code);
+        }
+
+        // Library build → check
+        var is_lib = false;
+        {
+            const mf = try std.fs.path.join(allocator, &.{ source, "jog.mod" });
+            defer allocator.free(mf);
+            if (fileExists(mf)) {
+                if (manifest.load(allocator, source)) |man_val| {
+                    var man = man_val;
+                    defer man.deinit();
+                    is_lib = man.kind == .library;
+                } else |_| {}
+            }
+        }
+        if (is_lib and std.mem.eql(u8, cmd, "build")) {
+            var argv: std.ArrayListUnmanaged([]const u8) = .{};
+            defer argv.deinit(allocator);
+            try argv.append(allocator, "check");
+            for (extras.items) |e| try argv.append(allocator, e);
+            for (owned_flags.items) |f| try argv.append(allocator, f);
             try argv.append(allocator, source);
             const code = try runJog(allocator, jog, argv.items, stdout, stderr);
             std.process.exit(code);
@@ -162,6 +274,7 @@ pub fn main() !void {
             try argv.append(allocator, "-o");
             try argv.append(allocator, out);
             for (extras.items) |e| try argv.append(allocator, e);
+            for (owned_flags.items) |f| try argv.append(allocator, f);
             const code = try runJog(allocator, jog, argv.items, stdout, stderr);
             if (code != 0) std.process.exit(code);
         }
@@ -192,25 +305,16 @@ fn usage(w: anytype) !void {
     try w.writeAll(
         \\usage: jog-build <command> [args]
         \\
-        \\v2 Zig front-end for JogCompiler v2 (Gates 1–4 + Chase-Lev).
-        \\Finds JOG / jog-v2 / sibling JogCompiler-v2 / PATH jog.
-        \\Concurrency (go/yield, with (Dispatcher), dispatcher_io) needs no
-        \\extra flags — the compiler always links runtime/linux_x64_coro.s.
+        \\v2 Zig build tool for JogCompiler v2: resolve path/.jogz, pack, cache.
         \\
         \\commands:
         \\  version
         \\  check [path] [--diag=json]
-        \\  build [path] -o OUT [--keep-asm] [--keep-c]
-        \\        [--target wasm32-emscripten] [--libdir DIR | -L DIR]...
-        \\  run   [path] -o OUT [--keep-asm] [-- prog-args...]
+        \\  build [path] -o OUT [--keep-asm] [--libdir DIR]...
+        \\  run   [path] -o OUT [-- prog-args...]
         \\  deps [--flags] [--test] [path]
-        \\        source paths, or --module=name=dir for LSP (via jog deps)
+        \\  pack [path] [-o OUT.jogz]
         \\  help
-        \\
-        \\path may be a .jog file, a directory with jog.mod, or jog.mod itself.
-        \\Directories without jog.mod still fall back to main.jog.
-        \\wasm32-emscripten: forwards to jog; output defaults to a.out.html.
-        \\check/build also forward --module name=dir when given.
         \\
     );
 }
@@ -224,51 +328,23 @@ fn findJog(allocator: std.mem.Allocator) ![]const u8 {
         const local = try std.fs.path.join(allocator, &.{ home, ".local/bin/jog-v2" });
         defer allocator.free(local);
         if (fileExists(local)) return try allocator.dupe(u8, local);
-        const local_jog = try std.fs.path.join(allocator, &.{ home, ".local/bin/jog" });
-        defer allocator.free(local_jog);
-        if (fileExists(local_jog)) {
-            if (try isV2Jog(allocator, local_jog)) return try allocator.dupe(u8, local_jog);
-        }
     }
     if (try siblingCompilerJog(allocator)) |p| return p;
-
-    const candidates = [_][]const u8{ "jog-v2", "jog" };
-    for (candidates) |name| {
-        if (try which(allocator, name)) |p| {
-            if (try isV2Jog(allocator, p) or std.mem.eql(u8, name, "jog-v2")) {
-                return p;
-            }
-            allocator.free(p);
-        }
-    }
-    std.debug.print("jog-build: JogCompiler v2 not found. Set JOG to zig-out/bin/jog or install jog-v2.\n", .{});
+    if (try which(allocator, "jog-v2")) |p| return p;
+    std.debug.print("jog-build: JogCompiler v2 not found. Set JOG.\n", .{});
     std.process.exit(1);
 }
 
-/// Prefer a checkout next to JogBuild: ../JogCompiler-v2/zig-out/bin/jog
-/// (also tried relative to this binary's directory).
 fn siblingCompilerJog(allocator: std.mem.Allocator) !?[]const u8 {
-    const rel = "JogCompiler-v2/zig-out/bin/jog";
-    const cwd_cand = try std.fs.path.join(allocator, &.{ "..", rel });
-    defer allocator.free(cwd_cand);
-    if (fileExists(cwd_cand)) {
-        if (try isV2Jog(allocator, cwd_cand)) return try allocator.dupe(u8, cwd_cand);
-    }
-
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe = std.fs.selfExePath(&buf) catch return null;
-    const exe_dir = std.fs.path.dirname(exe) orelse return null;
-    // zig-out/bin → ../../.. → Jog tree root sibling
-    const from_bin = try std.fs.path.join(allocator, &.{ exe_dir, "../../..", rel });
-    defer allocator.free(from_bin);
-    if (fileExists(from_bin)) {
-        if (try isV2Jog(allocator, from_bin)) return try allocator.dupe(u8, from_bin);
-    }
-    // source-tree layout: JogBuild/zig-out/bin → JogBuild → sibling
-    const from_build = try std.fs.path.join(allocator, &.{ exe_dir, "../..", rel });
-    defer allocator.free(from_build);
-    if (fileExists(from_build)) {
-        if (try isV2Jog(allocator, from_build)) return try allocator.dupe(u8, from_build);
+    const candidates = [_][]const u8{
+        "../JogCompiler-wt-shareable-jogz/zig-out/bin/jog",
+        "../JogCompiler-v2/zig-out/bin/jog",
+        "../JogCompiler/zig-out/bin/jog",
+    };
+    for (candidates) |rel| {
+        if (fileExists(rel)) {
+            if (try isV2Jog(allocator, rel)) return try allocator.dupe(u8, rel);
+        }
     }
     return null;
 }
@@ -281,7 +357,6 @@ fn isV2Jog(allocator: std.mem.Allocator, path: []const u8) !bool {
     const out = try child.stdout.?.readToEndAlloc(allocator, 4096);
     defer allocator.free(out);
     _ = try child.wait();
-    // Match 0.2.x-v2 and any "v2" marker from JogCompiler v2.
     return std.mem.indexOf(u8, out, "-v2") != null or std.mem.indexOf(u8, out, "v2") != null;
 }
 
@@ -302,8 +377,11 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-/// Prefer a module directory (pass through to jog) when jog.mod exists;
-/// otherwise keep the old main.jog fallback for plain directories.
+fn isDir(path: []const u8) bool {
+    const st = std.fs.cwd().statFile(path) catch return false;
+    return st.kind == .directory;
+}
+
 fn resolveBuildPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const st = std.fs.cwd().statFile(path) catch {
         return try allocator.dupe(u8, path);
@@ -311,16 +389,11 @@ fn resolveBuildPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (st.kind == .directory) {
         const mod_path = try std.fs.path.join(allocator, &.{ path, "jog.mod" });
         defer allocator.free(mod_path);
-        if (fileExists(mod_path)) {
-            return try allocator.dupe(u8, path);
-        }
+        if (fileExists(mod_path)) return try allocator.dupe(u8, path);
         return try std.fs.path.join(allocator, &.{ path, "main.jog" });
     }
-    // Bare jog.mod file → use its directory so deps/build see the module root.
     if (std.mem.eql(u8, std.fs.path.basename(path), "jog.mod")) {
-        if (std.fs.path.dirname(path)) |dir| {
-            return try allocator.dupe(u8, dir);
-        }
+        if (std.fs.path.dirname(path)) |dir| return try allocator.dupe(u8, dir);
     }
     return try allocator.dupe(u8, path);
 }
