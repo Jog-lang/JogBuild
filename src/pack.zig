@@ -52,7 +52,28 @@ pub fn packModule(
         .data = try allocator.dupe(u8, rewritten),
     });
 
-    try collectTree(allocator, &files, root_dir, "");
+    // Pack only `source` / `root` trees from jog.mod — never vendor/, prefix/,
+    // examples/, or other checkout noise (those hit FileTooBig on pch/objects).
+    if (man.sources.len == 0) {
+        try collectTree(allocator, &files, root_dir, "");
+    } else {
+        for (man.sources) |src| {
+            const abs = try std.fs.path.join(allocator, &.{ root_dir, src });
+            defer allocator.free(abs);
+            const st = std.fs.cwd().statFile(abs) catch |err| {
+                if (err == error.FileNotFound) return error.MissingSource;
+                return err;
+            };
+            if (st.kind == .directory) {
+                try collectTree(allocator, &files, abs, src);
+            } else if (st.kind == .file) {
+                const data = try std.fs.cwd().readFileAlloc(allocator, abs, 16 * 1024 * 1024);
+                errdefer allocator.free(data);
+                const zip_name = try std.fmt.allocPrint(allocator, "src/{s}", .{src});
+                try files.append(allocator, .{ .name = zip_name, .data = data });
+            }
+        }
+    }
 
     // Sort by name (byte order); manifest entry is separate and first in zip.
     std.mem.sort(FileEntry, files.items, {}, struct {
@@ -153,6 +174,11 @@ fn collectTree(
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         if (std.mem.eql(u8, entry.name, "out")) continue;
         if (std.mem.eql(u8, entry.name, "jog.lock")) continue;
+        // Safety net when packing a whole checkout (no `source` lines).
+        if (std.mem.eql(u8, entry.name, "vendor")) continue;
+        if (std.mem.eql(u8, entry.name, "prefix")) continue;
+        if (std.mem.eql(u8, entry.name, "prefix-emscripten")) continue;
+        if (std.mem.eql(u8, entry.name, "examples")) continue;
         const child_abs = try std.fs.path.join(allocator, &.{ abs_dir, entry.name });
         defer allocator.free(child_abs);
         const child_rel = if (rel_prefix.len == 0)
