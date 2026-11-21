@@ -159,11 +159,13 @@ fn installArchive(parent: std.mem.Allocator, a: std.mem.Allocator, jogz_path: []
 
     var mod_name: ?[]const u8 = null;
     var mod_ver: ?[]const u8 = null;
+    var mod_hash: ?[]const u8 = null;
     var line_it = std.mem.splitScalar(u8, man_text, '\n');
     while (line_it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (std.mem.startsWith(u8, line, "module ")) mod_name = std.mem.trim(u8, line["module ".len..], " \t");
         if (std.mem.startsWith(u8, line, "version ")) mod_ver = std.mem.trim(u8, line["version ".len..], " \t");
+        if (std.mem.startsWith(u8, line, "hash ")) mod_hash = std.mem.trim(u8, line["hash ".len..], " \t");
     }
     const name = mod_name orelse return error.BadArchiveManifest;
     const ver = mod_ver orelse return error.BadArchiveManifest;
@@ -172,9 +174,20 @@ fn installArchive(parent: std.mem.Allocator, a: std.mem.Allocator, jogz_path: []
     defer parent.free(final_dir);
     const final_src = try std.fs.path.join(a, &.{ cache, "mod", name, ver, "src" });
 
+    // Same version + same content hash → reuse cache. Different hash (repack) → invalidate.
     if (fileExists(final_src)) {
-        std.fs.cwd().deleteTree(unpack_dir) catch {};
-        return final_src;
+        const cached_hash = readCachedManifestHash(parent, final_dir) catch null;
+        defer if (cached_hash) |ch| parent.free(ch);
+        const same = blk: {
+            const nh = mod_hash orelse break :blk false;
+            const ch = cached_hash orelse break :blk false;
+            break :blk std.mem.eql(u8, nh, ch);
+        };
+        if (same) {
+            std.fs.cwd().deleteTree(unpack_dir) catch {};
+            return final_src;
+        }
+        std.fs.cwd().deleteTree(final_dir) catch {};
     }
 
     const parent_mod = try std.fs.path.join(parent, &.{ cache, "mod", name });
@@ -189,6 +202,21 @@ fn installArchive(parent: std.mem.Allocator, a: std.mem.Allocator, jogz_path: []
 
     if (!fileExists(final_src)) return error.ArchiveMissingSrc;
     return final_src;
+}
+
+fn readCachedManifestHash(allocator: std.mem.Allocator, final_dir: []const u8) !?[]const u8 {
+    const man_path = try std.fs.path.join(allocator, &.{ final_dir, "manifest" });
+    defer allocator.free(man_path);
+    const text = std.fs.cwd().readFileAlloc(allocator, man_path, 64 * 1024) catch return null;
+    defer allocator.free(text);
+    var line_it = std.mem.splitScalar(u8, text, '\n');
+    while (line_it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, line, "hash ")) {
+            return try allocator.dupe(u8, std.mem.trim(u8, line["hash ".len..], " \t"));
+        }
+    }
+    return null;
 }
 
 fn copyDir(allocator: std.mem.Allocator, src: []const u8, dest: []const u8) !void {
