@@ -1,0 +1,9 @@
+import hashlib
+
+fn main() {
+    if (greet() == 2) {
+        print("hash invalidate ok\n")
+    } else {
+        panic("hash invalidate BAD (stale cache)\n")
+    }
+}

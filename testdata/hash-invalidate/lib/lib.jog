@@ -1,0 +1,3 @@
+fn greet(): i64 {
+    return 2
+}
